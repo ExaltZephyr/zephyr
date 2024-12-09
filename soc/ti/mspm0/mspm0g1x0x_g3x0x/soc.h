@@ -19,7 +19,18 @@ extern "C" {
 
 /* clang-format off */
 
-#define POWER_STARTUP_DELAY (16)
+/*
+ * Per TRM Section 2.2.7 Peripheral Power Enable Control:
+ *
+ * After setting the ENABLE | KEY bits in the PWREN Register to enable a
+ * peripheral, wait at least 4 ULPCLK clock cycles before accessing the rest of
+ * the peripheral's memory-mapped registers. The 4 cycles allow for the bus
+ * isolation signals at the peripheral's bus interface to update.
+ *
+ * ULPCLK will either be equivalent or half of the main MCLK and CPUCLK,
+ * yielding the delay time of 8 cycles
+ */
+#define POWER_STARTUP_DELAY (8)
 
 /* clang-format on */
 
