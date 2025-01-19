@@ -119,6 +119,16 @@
 			status = "disabled";
 		};
 
+		dma: dma@4042a000 {
+			compatible = "ti,mspm0-dma";
+			reg = <0x4042a000 0x2000>;
+			interrupts = <31 0>;
+			#dma-cells = <2>;
+			dma-channels = <7>;
+			dma-requests = <25>;
+			status = "okay";
+		};
+
 	};
 };
 
