@@ -1,0 +1,38 @@
+source "subsys/logging/Kconfig.template.log_config"
+config ST_STM32_SDHC
+	bool "STM32 SDMMC driver support"
+	depends on DT_HAS_ST_STM32_SDHC_ENABLED
+	select USE_STM32_HAL_SD 
+	select USE_STM32_HAL_SDMMC
+	select USE_STM32_HAL_SD_EX 
+	select USE_STM32_HAL_MMC 
+	select USE_STM32_HAL_MMC_EX
+	select USE_STM32_LL_SDMMC
+	select USE_STM32_HAL_RCC
+	select USE_STM32_LL_RCC
+	select USE_STM32_HAL_CORTEX
+	select USE_STM32_HAL_DMA
+	select USE_STM32_HAL_PWR
+	select DMA if $(DT_STM32_SDMMC_HAS_DMA) && (SOC_SERIES_STM32F4X || SOC_SERIES_STM32F7X)
+	select PINCTRL
+	select RESET
+	default y
+	help
+	  Enable support for SDMMC on STM32 microcontrollers.
+
+config SDHC_STM32_DMA
+	bool "STM32 SDHC DMA driver support"
+	help
+	  Enables support for SDHC DMA mode on STM32 microcontrollers.
+
+
+config SDHC_CMD_TIMEOUT
+	int "Timeout for SD commands (in ms)"
+	default 200
+	help
+	  Default timeout in milliseconds for SD commands
+
+config SDHC_STM32_POLLING
+	bool "STM32 SDHC polling driver support"
+	help
+	  Enables support for SDHC polling mode on STM32 microcontrollers.
