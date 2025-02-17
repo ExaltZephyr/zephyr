@@ -1,8 +1,9 @@
 source "subsys/logging/Kconfig.template.log_config"
 config ST_STM32_SDHC
 	bool "STM32 SDMMC driver support"
-	depends on DT_HAS_ST_STM32_SDHC_ENABLED
+	depends on ZEPHYR_HAL_ST_MODULE && DT_HAS_ST_STM32_SDHC_ENABLED
 	select USE_STM32_HAL_SD 
+	select USE_STM32_HAL_SDIO
 	select USE_STM32_HAL_SDMMC
 	select USE_STM32_HAL_SD_EX 
 	select USE_STM32_HAL_MMC 
@@ -31,8 +32,3 @@ config SDHC_CMD_TIMEOUT
 	default 200
 	help
 	  Default timeout in milliseconds for SD commands
-
-config SDHC_STM32_POLLING
-	bool "STM32 SDHC polling driver support"
-	help
-	  Enables support for SDHC polling mode on STM32 microcontrollers.
