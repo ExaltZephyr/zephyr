@@ -426,7 +426,8 @@ int sdmmc_request_rca(struct sd_card *card)
 			return ret;
 		}
 		/* Card RCA is in upper 16 bits of response */
-		card->relative_addr = ((cmd.response[0U] & 0xFFFF0000) >> 16U);
+		card->relative_addr = (cmd.response[0U]);
+		LOG_INF("##relative addr:%d\n",card->relative_addr );
 	} while (card->relative_addr == 0U);
 	LOG_DBG("Card relative addr: %d", card->relative_addr);
 	return 0;
@@ -441,19 +442,19 @@ int sdmmc_select_card(struct sd_card *card)
 	int ret;
 
 	cmd.opcode = SD_SELECT_CARD;
-	cmd.arg = ((card->relative_addr) << 16U);
+	cmd.arg = (uint32_t) ((card->relative_addr) << 16U);
 	cmd.response_type = SD_RSP_TYPE_R1;
 	cmd.retries = CONFIG_SD_CMD_RETRIES;
 	cmd.timeout_ms = CONFIG_SD_CMD_TIMEOUT;
-
+	LOG_INF("#");
 	ret = sdhc_request(card->sdhc, &cmd, NULL);
 	if (ret) {
-		LOG_DBG("CMD7 failed");
+		LOG_INF("CMD7 failed:%d\n", ret);
 		return ret;
 	}
 	ret = sd_check_response(&cmd);
 	if (ret) {
-		LOG_DBG("CMD7 reports error");
+		LOG_INF("CMD7 reports error");
 		return ret;
 	}
 	return 0;

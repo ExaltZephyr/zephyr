@@ -1,0 +1,16 @@
+source "subsys/logging/Kconfig.template.log_config"
+config ST_STM32_SDHC
+	bool "STM32 SDMMC driver support"
+	depends on ZEPHYR_HAL_ST_MODULE && DT_HAS_ST_STM32_SDHC_ENABLED
+	select USE_STM32_HAL_SDIO
+	select USE_STM32_LL_SDMMC
+	select SDHC_SUPPORTS_NATIVE_MODE
+	default y
+	help
+	  Enable support for SDMMC on STM32 microcontrollers.
+
+config SDHC_CMD_TIMEOUT
+	int "Timeout for SDIO commands (in ms)"
+	default 200
+	help
+	  Default timeout in milliseconds for SDIO commands
