@@ -10,3 +10,9 @@ properties:
   hw-flow-control:
     type: boolean
     description: Set to enable RTS/CTS flow control at boot time
+
+  wifi-on-gpios:
+    description: |
+      Power-up/down gpio to control the internal regulators used
+      by the WiFi section of Wi-Fi device.
+    type: phandle-array

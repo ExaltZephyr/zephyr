@@ -22,9 +22,12 @@ typedef void (*irq_config_func_t)(const struct device *port);
 #define SD_TIMEOUT                  ((uint32_t)0x00100000U)
 #define STM32_SDIO_F_MIN            (SDMMC_CLOCK_400KHZ)
 #define STM32_SDIO_F_MAX            (MHZ(208))
+#define WLAN_CBUCK_DISCHARGE_MS     (10)
+#define WLAN_POWER_UP_DELAY_MS      (250)
 
 struct sdhc_stm32_config {
   bool                              hw_flow_control;
+  bool                              wifi_power_on;
   uint8_t                           bus_width;
   uint16_t                          clk_div;
   uint32_t                          power_delay_ms;
@@ -41,9 +44,45 @@ struct sdhc_stm32_data {
   struct k_sem         cmd_sem;
 };
 
-static HAL_StatusTypeDef SDIO_NoOpIdentifyCard(SD_HandleTypeDef *hsd)
+struct wifi_config_struct {
+  struct gpio_dt_spec wifi_on_gpio;
+};
+
+static struct wifi_config_struct wifi_cfg = {
+	.wifi_on_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(0), wifi_on_gpios, {0}),
+};
+
+int wifi_power_on(const struct device *dev)
 {
-    return HAL_OK;
+	int ret;
+	/* Check wifi_on_gpio instance */
+	if (!device_is_ready(wifi_cfg.wifi_on_gpio.port)) {
+		LOG_ERR("Error: failed to configure wifi_reg_on");
+		return -EIO;
+	}
+
+	/* Configure wifi_on_gpio port as output  */
+	ret = gpio_pin_configure_dt(&wifi_cfg.wifi_on_gpio, GPIO_OUTPUT);
+	if (ret) {
+		LOG_ERR("Error %d: failed to configure wifi_reg_on ", ret);
+		return ret;
+	}
+	ret = gpio_pin_set_dt(&wifi_cfg.wifi_on_gpio, 0);
+	if (ret) {
+		return ret;
+	}
+
+	/* Allow CBUCK regulator to discharge */
+	k_msleep(WLAN_CBUCK_DISCHARGE_MS);
+
+	/* WIFI power on */
+	ret = gpio_pin_set_dt(&wifi_cfg.wifi_on_gpio, 1);
+	if (ret) {
+		return ret;
+	}
+
+	k_msleep(WLAN_POWER_UP_DELAY_MS);
+  return ret;
 }
 
 static void i3c_stm32_event_isr(void *arg)
@@ -169,6 +208,31 @@ static uint32_t sdhc_stm32_go_idle_state(const struct device *dev){
     return res;
 }
 
+static int sdhc_stm32_rw_direct(struct sdhc_stm32_data *dev_data, struct sdhc_command *cmd){
+    int      res;
+    bool     raw_flag = false;
+    uint8_t  func     = (cmd->arg >> SDIO_CMD_ARG_FUNC_NUM_SHIFT) & 0x7;
+    uint32_t reg_addr = (cmd->arg >> SDIO_CMD_ARG_REG_ADDR_SHIFT) & SDIO_CMD_ARG_REG_ADDR_MASK;
+    bool     direction = (cmd->arg >> SDIO_CMD_ARG_RW_SHIFT) & 0x1;
+
+    if (direction == SDIO_IO_WRITE) {
+      raw_flag = (cmd->arg >> SDIO_DIRECT_CMD_ARG_RAW_SHIFT) & 0x1;
+    }
+
+    HAL_SDIO_DirectCmd_TypeDef   arg;
+    arg.Reg_Addr = reg_addr;
+    arg.ReadAfterWrite=raw_flag;
+    arg.IOFunctionNbr = func;
+
+    if (direction == SDIO_IO_WRITE) {
+      uint8_t data_in = cmd->arg & SDIO_DIRECT_CMD_DATA_MASK;
+      res = HAL_SDIO_WriteDirect(&dev_data->hsd, &arg, data_in);
+    } else {
+      res =  HAL_SDIO_ReadDirect(&dev_data->hsd, &arg, &cmd->response);
+    }
+    return res;
+}
+
 static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd, struct sdhc_data *data)
 {
    int res;
@@ -202,9 +266,8 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
         break;
 
       case SDIO_RW_DIRECT:
-        return res;
-      break;
-
+        res = sdhc_stm32_rw_direct(dev_data, cmd);
+        break;
       default:
         res = -ENOTSUP;
         LOG_DBG("Unsupported Command, opcode:%d\n.",cmd->opcode);
@@ -242,7 +305,7 @@ static int sdhc_stm32_set_io(const struct device *dev, struct sdhc_io *ios)
       k_msleep(DELAY_MS);
   }
 
-   if( (ios->signal_voltage == SD_VOL_1_8_V )) {
+  if( (ios->signal_voltage == SD_VOL_1_8_V )) {
     res = SDMMC_CmdVoltageSwitch(data->hsd.Instance);
     if(res != HAL_SDIO_ERROR_NONE) {
       LOG_ERR("Failed to set signal voltage as %d\n", ios->signal_voltage);
@@ -259,6 +322,16 @@ static int sdhc_stm32_set_io(const struct device *dev, struct sdhc_io *ios)
     (void)SDMMC_PowerState_ON(data->hsd.Instance);
     k_msleep(DELAY_MS);
   }
+
+  if ((ios->bus_width != 0) && (host_io->bus_width != ios->bus_width)) {
+    res =  HAL_SDIO_SetDataBusWidth(&data->hsd, ios->bus_width);
+    if(res != HAL_OK) {
+      LOG_ERR("Failed to set data bus width as: %d\n", data->hsd.ErrorCode);
+    } else {
+      LOG_INF("Data bus width configured as %d\n",  ios->bus_width);
+      host_io->bus_width = ios->bus_width;
+    }
+	}
 
   return res;
 }
@@ -298,9 +371,12 @@ static int sdhc_stm32_init(const struct device *dev)
   struct sdhc_stm32_data           *data = dev->data;
   const struct sdhc_stm32_config   *config = dev->config;
 
-  config->irq_config_func(dev);
-
-  HAL_SDIO_RegisterIdentifyCardCallback(&data->hsd, SDIO_NoOpIdentifyCard);
+  if (config->wifi_power_on) {
+    if (wifi_power_on(dev)) {
+      LOG_ERR("Failed to power WIFI Device on.");
+      return -ENODEV;
+    }
+  }
 
   ret = sdhc_stm32_activate(dev);
 	if (ret != 0) {
@@ -317,6 +393,7 @@ static int sdhc_stm32_init(const struct device *dev)
     LOG_INF("SDIO Init Passed Successfully.\n");
   }
 
+  config->irq_config_func(dev);
 	return ret;
 }
 
@@ -351,6 +428,7 @@ static int sdhc_stm32_init(const struct device *dev)
     .clk_div= DT_INST_PROP_OR(index, clk_div,4),	\
     .bus_width= DT_INST_PROP(index, bus_width),    \
     .power_delay_ms = DT_INST_PROP_OR(inst, power_delay_ms, 500),	\
+    .wifi_power_on = DT_NODE_HAS_PROP(DT_DRV_INST(index), wifi_on_gpios),  \
 	};                                                                                         \
 	static struct sdhc_stm32_data sdhc_stm32_data_##index = {                             \
     .hsd = {   \
