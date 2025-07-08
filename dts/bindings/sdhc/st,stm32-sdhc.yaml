@@ -9,3 +9,7 @@ properties:
   hw-flow-control:
     type: boolean
     description: Set to enable RTS/CTS flow control at boot time
+  support-1-8-v:
+    type: boolean
+    description: |
+        When defined, it indicates that the external SDIO circuit supports 1.8V signaling.  

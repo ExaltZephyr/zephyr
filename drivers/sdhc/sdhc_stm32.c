@@ -26,17 +26,18 @@ typedef void (*irq_config_func_t)(const struct device *port);
 #define SDHC_CMD_TIMEOUT  K_MSEC(200)
 
 struct sdhc_stm32_config {
-	uint16_t clk_div;
-	bool hw_flow_control;
+	bool hw_flow_control;              /* flag for enabling hardware flow control */
+	bool support_1_8_v;                /* flag indicating support for 1.8V signaling */
 	unsigned int max_freq;             /* Max bus frequency in Hz*/
 	unsigned int min_freq;             /* Min bus frequency in Hz*/
 	uint8_t bus_width;                 /* Width of the SDIO bus (1-bit or 4-bit mode) */
-	SD_HandleTypeDef *hsd;           /* Pointer to SD HAL handle */
+	uint16_t clk_div;
 	uint32_t power_delay_ms;      /* power delay prop for the host in milliseconds */
+	SD_HandleTypeDef *hsd;           /* Pointer to SD HAL handle */
 	const struct stm32_pclken *pclken;              /* Pointer to peripheral clock configuration */
 	const struct pinctrl_dev_config *pcfg;               /* Pointer to pin control configuration */
-	irq_config_func_t irq_config_func;    /* IRQ config function */
 	struct gpio_dt_spec cd_gpio; 
+	irq_config_func_t irq_config_func;    /* IRQ config function */
 };
 
 struct sdhc_stm32_data {
@@ -156,6 +157,30 @@ static int sdhc_stm32_read_blocks(const struct device *dev, struct sdhc_data *da
 	}
 
 	return ret;
+}
+
+static int sdhc_stm32_switch_to_1_8v(const struct device *dev){
+	uint32_t res =0;
+	struct sdhc_stm32_data *data = dev->data;
+	const struct sdhc_stm32_config *config = dev->config;
+
+	if(!data->props.host_caps.vol_180_support){
+		LOG_ERR("Host does not support 1.8v signaling");
+		return -ENOTSUP;
+	}
+	//config->hsd->SdCard.CardSpeed = CARD_ULTRA_HIGH_SPEED;
+
+	/* Start switching procedue */
+	config->hsd->Instance->POWER |= SDMMC_POWER_VSWITCHEN;
+
+	res = SDMMC_CmdVoltageSwitch(config->hsd->Instance);
+	if(res != 0) {
+		LOG_ERR("CMD11 failed: %#x", res);
+		return -EIO; 
+	}
+
+	LOG_INF("Successfully switched to 1.8V signaling");
+	return 0;
 }
 
 static uint32_t sdhc_stm32_go_idle_state(const struct device *dev){
@@ -301,6 +326,10 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 		case SD_SET_BLOCK_SIZE:
 			res = SDMMC_CmdBlockLength(config->hsd->Instance, (uint32_t)cmd->arg);
 			break;
+		case SD_VOL_SWITCH:
+		    res = sdhc_stm32_switch_to_1_8v(dev);
+			break;
+
 		default:
 			res = HAL_ERROR;
 			LOG_ERR("Unsupported Command: opcode :%d.", cmd->opcode);
@@ -565,7 +594,7 @@ static void sdhc_stm32_init_props(const struct device *dev)
 	props->f_max = sdhc_config->max_freq;
 	props->power_delay = sdhc_config->power_delay_ms;
 	props->host_caps.vol_330_support = true;
-	// props->host_caps.vol_180_support = sdhc_config->support_1_8_v;
+	props->host_caps.vol_180_support = sdhc_config->support_1_8_v;
 	props->host_caps.bus_8_bit_support = (sdhc_config->bus_width == SDHC_BUS_WIDTH8BIT);
 	props->host_caps.bus_4_bit_support = (sdhc_config->bus_width == SDHC_BUS_WIDTH4BIT);
 }
@@ -702,6 +731,7 @@ static int sdhc_stm32_pm_action(const struct device *dev, enum pm_device_action 
 		.hw_flow_control= DT_INST_PROP_OR(index, hw_flow_control,0),	\
 		.clk_div= DT_INST_PROP_OR(index, clk_div,4),	\
 		.power_delay_ms = DT_INST_PROP_OR(inst, power_delay_ms, 500),	\
+		.support_1_8_v = DT_INST_PROP(index, support_1_8_v),	\
 		.min_freq = DT_INST_PROP(index, min_bus_freq),	\
 		.max_freq = DT_INST_PROP(index, max_bus_freq),	\
 		.cd_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(index), cd_gpios, {0}),\
