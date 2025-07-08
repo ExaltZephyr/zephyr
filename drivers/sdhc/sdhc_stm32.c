@@ -350,7 +350,6 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 		case SD_SET_BLOCK_SIZE:
 			res = SDMMC_CmdBlockLength(config->hsd->Instance, (uint32_t)cmd->arg);
 			break;
-
 		case SD_VOL_SWITCH:
 		    res = sdhc_stm32_switch_to_1_8v(dev);
 			break;
@@ -420,7 +419,6 @@ out:
     k_mutex_unlock(&dev_data->bus_mutex);
 
     return res ;
-
 }
 
 static int sdhc_stm32_reset(const struct device *dev)
@@ -439,7 +437,6 @@ static int sdhc_stm32_reset(const struct device *dev)
 	k_msleep(data->props.power_delay);
 	(void)SDMMC_PowerState_ON(config->hsd->Instance);
 	k_msleep(data->props.power_delay);
-
 
 	/* Resetting card */
 	res = sdhc_stm32_go_idle_state(dev);
