@@ -209,6 +209,10 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 		return -EBUSY;
 	}
 
+	(void)pm_device_runtime_get(dev);
+	/* Prevent the clocks to be stopped during the request */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+
 	switch (cmd->opcode) {
 		case SD_SEND_IF_COND:
 			res = SDMMC_CmdOperCond(config->hsd->Instance);
@@ -244,7 +248,7 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 			break;
 
 		case SD_SEND_RELATIVE_ADDR:
-			res = SDMMC_CmdSetRelAdd(config->hsd->Instance,  (uint16_t *)&cmd->response);
+			res = SDMMC_CmdSetRelAdd(config->hsd->Instance, (uint16_t *)&cmd->response);
 			if (res == 0U) {
 				/*
 				* Restore RCA by reversing the double 16-bit right shift from
@@ -259,7 +263,7 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 			break;
 
 		case SD_SWITCH:
-			//res = SD_SwitchSpeed(config->hsd, cmd->arg);
+			res = SD_SwitchSpeed(config->hsd, cmd->arg);
 			break;
 
 		case SD_APP_CMD:
@@ -292,7 +296,7 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 			
 			break;
 		case SD_APP_SEND_SCR:
-			//res = SD_FindSCR(config->hsd, data->data);
+			res = SD_FindSCR(config->hsd, data->data);
 			break;
 		case SD_SET_BLOCK_SIZE:
 			res = SDMMC_CmdBlockLength(config->hsd->Instance, (uint32_t)cmd->arg);
@@ -309,6 +313,8 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 		sdhc_stm32_log_err_type(config->hsd);
 	}
 
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	(void)pm_device_runtime_put(dev);
 	k_mutex_unlock(&dev_data->bus_mutex);
 
 	return res;
@@ -322,9 +328,9 @@ static int sdhc_stm32_get_card_present(const struct device *dev)
 
     int res = 0;
 
+    k_mutex_lock(&dev_data->bus_mutex, K_FOREVER);
     (void)pm_device_runtime_get(dev);
     pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
-    k_mutex_lock(&dev_data->bus_mutex, K_FOREVER);
 
     if (config->cd_gpio.port != NULL) {
         if (!device_is_ready(config->cd_gpio.port)) {
@@ -354,9 +360,10 @@ static int sdhc_stm32_get_card_present(const struct device *dev)
     }
 
 out:
-    k_mutex_unlock(&dev_data->bus_mutex);
+
     pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
     (void)pm_device_runtime_put(dev);
+    k_mutex_unlock(&dev_data->bus_mutex);
 
     return res;
 
@@ -364,8 +371,14 @@ out:
 
 static int sdhc_stm32_reset(const struct device *dev)
 {
+	int res = 0;
 	struct sdhc_stm32_data *data = dev->data;
 	const struct sdhc_stm32_config *config = dev->config;
+
+	k_mutex_lock(&data->bus_mutex, K_FOREVER);
+	(void)pm_device_runtime_get(dev);
+	/* Prevent the clocks to be stopped during the request */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
 	/* Resetting Host controller */
 	(void)SDMMC_PowerState_OFF(config->hsd->Instance);
@@ -373,8 +386,15 @@ static int sdhc_stm32_reset(const struct device *dev)
 	(void)SDMMC_PowerState_ON(config->hsd->Instance);
 	k_msleep(data->props.power_delay);
 
+
 	/* Resetting card */
-	return sdhc_stm32_go_idle_state(dev);
+	res = sdhc_stm32_go_idle_state(dev);
+
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	(void)pm_device_runtime_put(dev);
+	k_mutex_unlock(&data->bus_mutex);
+
+	return res;
 }
 
 static int sdhc_stm32_card_busy(const struct device *dev)
@@ -392,6 +412,11 @@ static int sdhc_stm32_set_io(const struct device *dev, struct sdhc_io *ios)
 	struct sdhc_host_props *props = &data->props;
 	struct sdhc_io *host_io = &data->host_io;
 	const struct sdhc_stm32_config *config = dev->config;
+
+	k_mutex_lock(&data->bus_mutex, K_FOREVER);
+	(void)pm_device_runtime_get(dev);
+	/* Prevent the clocks to be stopped during the request */
+	pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 
 	if ((ios->bus_width != 0) && (host_io->bus_width != ios->bus_width)) {
 		uint32_t bus_width_reg_value;
@@ -432,6 +457,10 @@ static int sdhc_stm32_set_io(const struct device *dev, struct sdhc_io *ios)
 	}
 
 out:
+	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	(void)pm_device_runtime_put(dev);
+	k_mutex_unlock(&data->bus_mutex);
+
 	return res;
 }
 
@@ -566,17 +595,17 @@ static int sdhc_stm32_init(const struct device *dev)
 
 	config->irq_config_func(dev);
 
-  if (config->cd_gpio.port != NULL) {
-	    if (!gpio_is_ready_dt(&config->cd_gpio)) {
-		    LOG_ERR("GPIO port for carrier-detect pin is not ready");
-		    return -ENODEV;
-	    }
-	    int ret = gpio_pin_configure_dt(&config->cd_gpio, GPIO_INPUT| GPIO_PULL_UP);
-	    if (ret < 0) {
-		    LOG_ERR("Couldn't configure carrier-detect pin; (%d)", ret);
-		    return ret;
-	    }
-    }
+	if (config->cd_gpio.port != NULL) {
+		if (!gpio_is_ready_dt(&config->cd_gpio)) {
+			LOG_ERR("GPIO port for carrier-detect pin is not ready");
+			return -ENODEV;
+		}
+		int ret = gpio_pin_configure_dt(&config->cd_gpio, GPIO_INPUT| GPIO_PULL_UP);
+		if (ret < 0) {
+			LOG_ERR("Couldn't configure carrier-detect pin; (%d)", ret);
+			return ret;
+		}
+	}
 
 	return 0;
 }
@@ -595,6 +624,44 @@ static void sdhc_stm32_event_isr(void *arg)
 
 	HAL_SD_IRQHandler(config->hsd);
 }
+
+#ifdef CONFIG_PM_DEVICE
+static int sdhc_stm32_suspend(const struct device *dev)
+{
+	int ret;
+	const struct sdhc_stm32_config *cfg = (struct sdhc_stm32_config *)dev->config;
+	const struct device *const clk = DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE);
+
+	/* Disable device clock. */
+	ret = clock_control_off(clk, (clock_control_subsys_t)(uintptr_t)&cfg->pclken[0]);
+	if (ret < 0) {
+		LOG_ERR("Failed to disable SDHC clock during PM suspend process");
+		return ret;
+	}
+
+	/* Move pins to sleep state */
+	ret = pinctrl_apply_state(cfg->pcfg, PINCTRL_STATE_SLEEP);
+	if (ret == -ENOENT) {
+		/* Warn but don't block suspend */
+		LOG_WRN_ONCE("SDHC pinctrl sleep state not available");
+		ret = 0;
+	}
+
+	return ret;
+}
+
+static int sdhc_stm32_pm_action(const struct device *dev, enum pm_device_action action)
+{
+	switch (action) {
+	case PM_DEVICE_ACTION_RESUME:
+		return sdhc_stm32_activate(dev);
+	case PM_DEVICE_ACTION_SUSPEND:
+		return sdhc_stm32_suspend(dev);
+	default:
+		return -ENOTSUP;
+	}
+}
+#endif /* CONFIG_PM_DEVICE */
 
 #define STM32_SDHC_IRQ_CONNECT_AND_ENABLE(index)	\
 	do {	\
@@ -645,6 +712,8 @@ static void sdhc_stm32_event_isr(void *arg)
 			.bus_width= DT_INST_PROP_OR(index, bus_width, 4),	\
 		}	\
 	};	\
+	\
+	PM_DEVICE_DT_INST_DEFINE(index, sdhc_stm32_pm_action);	\
 	\
 	DEVICE_DT_INST_DEFINE(index,	\
 			&sdhc_stm32_init,	\
