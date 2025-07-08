@@ -13,6 +13,10 @@
 #include <zephyr/drivers/reset.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/pm/device.h>
+#include <zephyr/pm/device_runtime.h>
+#include <zephyr/pm/policy.h>
 
 
 LOG_MODULE_REGISTER(sdhc_stm32, CONFIG_SDHC_LOG_LEVEL);
@@ -32,6 +36,7 @@ struct sdhc_stm32_config {
 	const struct stm32_pclken *pclken;              /* Pointer to peripheral clock configuration */
 	const struct pinctrl_dev_config *pcfg;               /* Pointer to pin control configuration */
 	irq_config_func_t irq_config_func;    /* IRQ config function */
+	struct gpio_dt_spec cd_gpio; 
 };
 
 struct sdhc_stm32_data {
@@ -311,16 +316,50 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 
 static int sdhc_stm32_get_card_present(const struct device *dev)
 {
-	struct sdhc_stm32_data *dev_data = dev->data;
-	const struct sdhc_stm32_config *config = dev->config;
+    struct sdhc_stm32_data *dev_data = dev->data;
 
-	HAL_SD_CardStateTypeDef card_state = HAL_SD_GetCardState(config->hsd);
-	if((HAL_SD_GetError(config->hsd) == SDMMC_ERROR_CMD_RSP_TIMEOUT) || (card_state == HAL_SD_CARD_DISCONNECTED)) {
-		sdhc_stm32_log_err_type(config->hsd);
-		return false;
-	}
+    const struct sdhc_stm32_config *config = dev->config;
 
-	return true;
+    int res = 0;
+
+    (void)pm_device_runtime_get(dev);
+    pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+    k_mutex_lock(&dev_data->bus_mutex, K_FOREVER);
+
+    if (config->cd_gpio.port != NULL) {
+        if (!device_is_ready(config->cd_gpio.port)) {
+            LOG_ERR("Card detect GPIO not ready");
+            res = -ENODEV;
+            goto out;
+        }
+        res = gpio_pin_get_dt(&config->cd_gpio);
+        LOG_INF("from gpio %d ",res);
+
+        res = (res == 0);
+
+        
+    } else {
+	    // Try CMD0 or CMD55/ACMD41 (send operation condition)
+	    if (SDMMC_CmdGoIdleState(SDMMC1) != 0) {
+		    LOG_ERR("Card can't go to Idle State");
+		    res = 1;
+	    } else {
+		    if (SDMMC_CmdOperCond(SDMMC1) != 0) {
+			    LOG_ERR("Card not responding to OC");
+			    res = 1; // Not present
+		    } else {
+			    res = 0; // Present
+		    }
+	    }
+    }
+
+out:
+    k_mutex_unlock(&dev_data->bus_mutex);
+    pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+    (void)pm_device_runtime_put(dev);
+
+    return res;
+
 }
 
 static int sdhc_stm32_reset(const struct device *dev)
@@ -527,6 +566,18 @@ static int sdhc_stm32_init(const struct device *dev)
 
 	config->irq_config_func(dev);
 
+  if (config->cd_gpio.port != NULL) {
+	    if (!gpio_is_ready_dt(&config->cd_gpio)) {
+		    LOG_ERR("GPIO port for carrier-detect pin is not ready");
+		    return -ENODEV;
+	    }
+	    int ret = gpio_pin_configure_dt(&config->cd_gpio, GPIO_INPUT| GPIO_PULL_UP);
+	    if (ret < 0) {
+		    LOG_ERR("Couldn't configure carrier-detect pin; (%d)", ret);
+		    return ret;
+	    }
+    }
+
 	return 0;
 }
 
@@ -586,6 +637,7 @@ static void sdhc_stm32_event_isr(void *arg)
 		.power_delay_ms = DT_INST_PROP_OR(inst, power_delay_ms, 500),	\
 		.min_freq = DT_INST_PROP(index, min_bus_freq),	\
 		.max_freq = DT_INST_PROP(index, max_bus_freq),	\
+		.cd_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(index), cd_gpios, {0}),\
 	};	\
 	\
 	static struct sdhc_stm32_data sdhc_stm32_data_##index = {	\
