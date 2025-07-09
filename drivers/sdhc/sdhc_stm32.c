@@ -126,15 +126,17 @@ static int sdhc_stm32_write_blocks(const struct device *dev, struct sdhc_data *d
 	const struct sdhc_stm32_config *config = dev->config;
 	__ASSERT(data != NULL, "Data is required for this command.");
 
-	#ifdef CONFIG_SDHC_STM32_DMA
+	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
 		ret = HAL_SD_WriteBlocks_DMA(config->hsd, data->data, data->block_addr, data->blocks);
-	#else
-		ret = HAL_SD_WriteBlocks_IT(config->hsd, data->data, data->block_addr, data->blocks);
-	#endif
+	} else {
+		ret = HAL_SD_WriteBlocks(config->hsd, data->data, data->block_addr, data->blocks, data->timeout_ms);
+	}
 
-	if (k_sem_take(&dev_data->cmd_sem, SDHC_CMD_TIMEOUT) != 0) {
-		LOG_ERR("Failed to acquire Semaphore\n");
-		return -ETIMEDOUT;
+	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
+		if (k_sem_take(&dev_data->cmd_sem, SDHC_CMD_TIMEOUT) != 0) {
+			LOG_ERR("Failed to acquire Semaphore\n");
+			return -ETIMEDOUT;
+		}
 	}
 
 	return ret;
@@ -145,17 +147,18 @@ static int sdhc_stm32_read_blocks(const struct device *dev, struct sdhc_data *da
 	struct sdhc_stm32_data *dev_data = dev->data;
 	const struct sdhc_stm32_config *config = dev->config;
 
-	#ifdef CONFIG_SDHC_STM32_DMA
+	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
 		ret = HAL_SD_ReadBlocks_DMA(config->hsd, data->data, data->block_addr, data->blocks);
-	#else
-		ret = HAL_SD_ReadBlocks_IT(config->hsd, data->data, data->block_addr, data->blocks);
-	#endif
-
-	if (k_sem_take(&dev_data->cmd_sem, SDHC_CMD_TIMEOUT) != 0) {
-		LOG_ERR("Failed to acquire Semaphore\n");
-		return -ETIMEDOUT;
+	} else {
+		ret = HAL_SD_ReadBlocks(config->hsd, data->data, data->block_addr, data->blocks, data->timeout_ms);
 	}
 
+	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
+		if (k_sem_take(&dev_data->cmd_sem, SDHC_CMD_TIMEOUT) != 0) {
+			LOG_ERR("Failed to acquire Semaphore\n");
+			return -ETIMEDOUT;
+		}
+	}
 	return ret;
 }
 
@@ -220,6 +223,24 @@ static int sdhc_stm32_erase_block(const struct device *dev, struct sdhc_data *da
 		return HAL_ERROR;
 	}
 	return res;
+}
+
+static uint32_t sdhc_stm32_get_sd_status(SD_HandleTypeDef *hsd, uint32_t card_relative_address, uint32_t *card_status_resp)
+{
+	uint32_t res;
+
+	/* Send Status command */
+	res = SDMMC_CmdSendStatus(hsd->Instance, (uint32_t)(card_relative_address));
+	if (res != HAL_SD_ERROR_NONE)
+	{
+		LOG_ERR("Get Card status failed\n");
+		return res;
+	}
+
+	/* Get SD card status */
+	*card_status_resp = SDMMC_GetResponse(hsd->Instance, SDMMC_RESP1);
+
+	return 0;
 }
 
 static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd, struct sdhc_data *data)
@@ -326,10 +347,14 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 		case SD_SET_BLOCK_SIZE:
 			res = SDMMC_CmdBlockLength(config->hsd->Instance, (uint32_t)cmd->arg);
 			break;
+
 		case SD_VOL_SWITCH:
 		    res = sdhc_stm32_switch_to_1_8v(dev);
 			break;
 
+		case SD_SEND_STATUS:
+			res = sdhc_stm32_get_sd_status(config->hsd, cmd->arg, &cmd->response[0]);
+			break;
 		default:
 			res = HAL_ERROR;
 			LOG_ERR("Unsupported Command: opcode :%d.", cmd->opcode);
