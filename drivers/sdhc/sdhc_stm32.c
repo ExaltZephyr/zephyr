@@ -52,7 +52,7 @@ void sdhc_stm32_log_err_type(SD_HandleTypeDef *hsd)
 	uint32_t error_code = HAL_SD_GetError(hsd);
 
 	// Timeout and busy errors
-	if (error_code & (HAL_SD_ERROR_TIMEOUT | HAL_SD_ERROR_CMD_RSP_TIMEOUT)) {
+	if (error_code & (HAL_SD_ERROR_TIMEOUT | HAL_SD_ERROR_CMD_RSP_TIMEOUT | HAL_SD_ERROR_DATA_TIMEOUT )) {
 		LOG_ERR("SDIO Timeout Error\n");
 	}
 	if (error_code & HAL_SD_ERROR_BUSY) {
@@ -103,19 +103,22 @@ void sdhc_stm32_log_err_type(SD_HandleTypeDef *hsd)
 
 	// Other general errors
 	if (error_code & (HAL_SD_ERROR_GENERAL_UNKNOWN_ERR | HAL_SD_ERROR_ERASE_RESET | HAL_SD_ERROR_AKE_SEQ_ERR | HAL_SD_ERROR_REQUEST_NOT_APPLICABLE)) {
-		LOG_ERR("SDIO General Error\n");
+		LOG_ERR("SDIO General Error");
 	}
 	if (error_code & HAL_SD_ERROR_PARAM) {
-		LOG_ERR("SDIO Parameter Error\n");
+		LOG_ERR("SDIO Parameter Error");
 	}
 	if (error_code & HAL_SD_ERROR_INVALID_VOLTRANGE) {
-		LOG_ERR("SDIO Invalid Voltage Range Error\n");
+		LOG_ERR("SDIO Invalid Voltage Range Error");
 	}
 	if (error_code & HAL_SD_ERROR_UNSUPPORTED_FEATURE) {
-		LOG_ERR("SDIO Unsupported Feature Error\n");
+		LOG_ERR("SDIO Unsupported Feature Error");
 	}
 	if (error_code & HAL_SD_ERROR_DMA) {
-		LOG_ERR("SDIO DMA Error\n");
+		LOG_ERR("SDIO DMA Error");
+	}
+	if (error_code & HAL_SD_ERROR_INVALID_CALLBACK) {
+		LOG_ERR("SD Invalid Callback Error");
 	}
 	hsd->ErrorCode = HAL_SD_ERROR_NONE;
 }
@@ -191,7 +194,7 @@ static uint32_t sdhc_stm32_go_idle_state(const struct device *dev){
 	struct sdhc_stm32_data *dev_data = dev->data;
 	const struct sdhc_stm32_config *config = dev->config;
 
-	res = SDMMC_CmdGoIdleState(SDMMC1);
+	res = SDMMC_CmdGoIdleState(config->hsd->Instance);
 	if (res != HAL_OK) {
 		printk("go to idle failed\n");
 		sdhc_stm32_log_err_type(config->hsd);
@@ -394,21 +397,18 @@ static int sdhc_stm32_get_card_present(const struct device *dev)
         }
         res = gpio_pin_get_dt(&config->cd_gpio);
         LOG_INF("from gpio %d ",res);
-
-        res = (res == 0);
-
         
     } else {
 	    // Try CMD0 or CMD55/ACMD41 (send operation condition)
-	    if (SDMMC_CmdGoIdleState(SDMMC1) != 0) {
+	    if (SDMMC_CmdGoIdleState(config->hsd->Instance) != 0) {
 		    LOG_ERR("Card can't go to Idle State");
 		    res = 1;
 	    } else {
-		    if (SDMMC_CmdOperCond(SDMMC1) != 0) {
+		    if (SDMMC_CmdOperCond(config->hsd->Instance) != 0) {
 			    LOG_ERR("Card not responding to OC");
-			    res = 1; // Not present
+			    res = 0; // Not present
 		    } else {
-			    res = 0; // Present
+			    res = 1; // Present
 		    }
 	    }
     }
@@ -419,7 +419,7 @@ out:
     (void)pm_device_runtime_put(dev);
     k_mutex_unlock(&dev_data->bus_mutex);
 
-    return res;
+    return res ;
 
 }
 
