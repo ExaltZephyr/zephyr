@@ -20,7 +20,7 @@
 
 
 LOG_MODULE_REGISTER(sdhc_stm32, CONFIG_SDHC_LOG_LEVEL);
-typedef void (*irq_config_func_t)(const struct device *port);
+typedef void (*irq_config_func_t)(void);
 
 #define SD_TIMEOUT        ((uint32_t)0x00100000U)
 #define SDHC_CMD_TIMEOUT  K_MSEC(200)
@@ -53,73 +53,37 @@ void sdhc_stm32_log_err_type(SD_HandleTypeDef *hsd)
 
 	// Timeout and busy errors
 	if (error_code & (HAL_SD_ERROR_TIMEOUT | HAL_SD_ERROR_CMD_RSP_TIMEOUT | HAL_SD_ERROR_DATA_TIMEOUT )) {
-		LOG_ERR("SDIO Timeout Error\n");
-	}
-	if (error_code & HAL_SD_ERROR_BUSY) {
-		LOG_ERR("SDIO Busy Error\n");
-	}
-
-	// CRC-related errors
-	if (error_code & (HAL_SD_ERROR_CMD_CRC_FAIL | HAL_SD_ERROR_DATA_CRC_FAIL | HAL_SD_ERROR_COM_CRC_FAILED)) {
-		LOG_ERR("SDIO CRC Error (Command/Data/Communication)\n");
-	}
-
-	// FIFO underrun/overrun errors
-	if (error_code & HAL_SD_ERROR_TX_UNDERRUN) {
-		LOG_ERR("SDIO FIFO Transmit Underrun Error\n");
-	}
-	if (error_code & HAL_SD_ERROR_RX_OVERRUN) {
-		LOG_ERR("SDIO FIFO Receive Overrun Error\n");
-	}
-
-	// Address-related errors
-	if (error_code & (HAL_SD_ERROR_ADDR_MISALIGNED | HAL_SD_ERROR_ADDR_OUT_OF_RANGE)) {
-		LOG_ERR("SDIO Address Error (Misaligned/Out of Range)\n");
-	}
-
-	// Block and erase errors
-	if (error_code & (HAL_SD_ERROR_BLOCK_LEN_ERR | HAL_SD_ERROR_ERASE_SEQ_ERR | HAL_SD_ERROR_BAD_ERASE_PARAM | HAL_SD_ERROR_WP_ERASE_SKIP)) {
-		LOG_ERR("SDIO Block/Erase Error\n");
-	}
-
-	// Card-related errors
-	if (error_code & (HAL_SD_ERROR_WRITE_PROT_VIOLATION | HAL_SD_ERROR_LOCK_UNLOCK_FAILED | HAL_SD_ERROR_ILLEGAL_CMD)) {
-		LOG_ERR("SDIO Card Access Error (Write Protect/Lock/Illegal Command)\n");
-	}
-	if (error_code & (HAL_SD_ERROR_CARD_ECC_FAILED | HAL_SD_ERROR_CARD_ECC_DISABLED)) {
-		LOG_ERR("SDIO Card ECC Error (Failed/Disabled)\n");
-	}
-	if (error_code & HAL_SD_ERROR_CC_ERR) {
-		LOG_ERR("SDIO Card Controller Error\n");
+		LOG_ERR("SDHC Timeout occurred (command or data response)");
+	} else if (error_code & HAL_SD_ERROR_BUSY) {
+		LOG_ERR("SDHC interface is busy.");
+	} else if (error_code & (HAL_SD_ERROR_CMD_CRC_FAIL | HAL_SD_ERROR_DATA_CRC_FAIL | HAL_SD_ERROR_COM_CRC_FAILED)) {
+		LOG_ERR("CRC failure detected (command, data, or communication)");
+	} else if (error_code & HAL_SD_ERROR_TX_UNDERRUN) {
+		LOG_ERR("Transmit FIFO underrun during SD/MMC write");
+	} else if (error_code & HAL_SD_ERROR_RX_OVERRUN) {
+		LOG_ERR("Receive FIFO overrun during SD/MMC read");
+	} else if (error_code & (HAL_SD_ERROR_ADDR_MISALIGNED | HAL_SD_ERROR_ADDR_OUT_OF_RANGE)) {
+		LOG_ERR("Addressing error: misaligned or out-of-range access");
+	} else if (error_code & (HAL_SD_ERROR_BLOCK_LEN_ERR | HAL_SD_ERROR_ERASE_SEQ_ERR | HAL_SD_ERROR_BAD_ERASE_PARAM | HAL_SD_ERROR_WP_ERASE_SKIP)) {
+		LOG_ERR("Block or erase sequence error");
+	} else if (error_code & (HAL_SD_ERROR_WRITE_PROT_VIOLATION | HAL_SD_ERROR_LOCK_UNLOCK_FAILED | HAL_SD_ERROR_ILLEGAL_CMD)) {
+		LOG_ERR("Access violation: write-protect, lock/unlock, or illegal command");
+	} else if (error_code & HAL_SD_ERROR_CID_CSD_OVERWRITE) {
+		LOG_ERR("CID/CSD register overwrite attempted");
+	} else if (error_code & (HAL_SD_ERROR_GENERAL_UNKNOWN_ERR | HAL_SD_ERROR_ERASE_RESET | HAL_SD_ERROR_AKE_SEQ_ERR | HAL_SD_ERROR_REQUEST_NOT_APPLICABLE)) {
+		LOG_ERR("General SDHC error or invalid operation");
+	} else if (error_code & HAL_SD_ERROR_PARAM) {
+		LOG_ERR("Invalid parameter passed to SD/MMC operation");
+	} else if (error_code & HAL_SD_ERROR_INVALID_VOLTRANGE) {
+		LOG_ERR("Card does not support the requested voltage range.");
+	} else if (error_code & HAL_SD_ERROR_UNSUPPORTED_FEATURE) {
+		LOG_ERR("Requested feature is not supported by the card");
+	} else if (error_code & HAL_SD_ERROR_DMA) {
+		LOG_ERR("DMA transfer error occurred");
+	} else {
+		LOG_ERR("Unknown SDHC Error: 0x%0x", error_code);
 	}
 
-	// Stream and overwrite errors
-	if (error_code & (HAL_SD_ERROR_STREAM_READ_UNDERRUN | HAL_SD_ERROR_STREAM_WRITE_OVERRUN)) {
-		LOG_ERR("SDIO Stream Error (Read Underrun/Write Overrun)\n");
-	}
-	if (error_code & HAL_SD_ERROR_CID_CSD_OVERWRITE) {
-		LOG_ERR("SDIO CID/CSD Overwrite Error\n");
-	}
-
-	// Other general errors
-	if (error_code & (HAL_SD_ERROR_GENERAL_UNKNOWN_ERR | HAL_SD_ERROR_ERASE_RESET | HAL_SD_ERROR_AKE_SEQ_ERR | HAL_SD_ERROR_REQUEST_NOT_APPLICABLE)) {
-		LOG_ERR("SDIO General Error");
-	}
-	if (error_code & HAL_SD_ERROR_PARAM) {
-		LOG_ERR("SDIO Parameter Error");
-	}
-	if (error_code & HAL_SD_ERROR_INVALID_VOLTRANGE) {
-		LOG_ERR("SDIO Invalid Voltage Range Error");
-	}
-	if (error_code & HAL_SD_ERROR_UNSUPPORTED_FEATURE) {
-		LOG_ERR("SDIO Unsupported Feature Error");
-	}
-	if (error_code & HAL_SD_ERROR_DMA) {
-		LOG_ERR("SDIO DMA Error");
-	}
-	if (error_code & HAL_SD_ERROR_INVALID_CALLBACK) {
-		LOG_ERR("SD Invalid Callback Error");
-	}
 	hsd->ErrorCode = HAL_SD_ERROR_NONE;
 }
 
@@ -142,7 +106,7 @@ static int sdhc_stm32_write_blocks(const struct device *dev, struct sdhc_data *d
 		}
 	}
 
-	return ret;
+	return ret == HAL_OK ? 0 : -EIO;
 }
 
 static int sdhc_stm32_read_blocks(const struct device *dev, struct sdhc_data *data){
@@ -162,11 +126,12 @@ static int sdhc_stm32_read_blocks(const struct device *dev, struct sdhc_data *da
 			return -ETIMEDOUT;
 		}
 	}
-	return ret;
+
+	return ret == HAL_OK ? 0 : -EIO;
 }
 
 static int sdhc_stm32_switch_to_1_8v(const struct device *dev){
-	uint32_t res =0;
+	uint32_t res;
 	struct sdhc_stm32_data *data = dev->data;
 	const struct sdhc_stm32_config *config = dev->config;
 
@@ -198,17 +163,10 @@ static uint32_t sdhc_stm32_go_idle_state(const struct device *dev){
 	if (res != HAL_OK) {
 		printk("go to idle failed\n");
 		sdhc_stm32_log_err_type(config->hsd);
-		return res;
+		return -EIO;
 	}
 
 	return 0;
-}
-
-static int sdhc_stm32_abort(const struct device *dev){
-	int res;
-	const struct sdhc_stm32_config *config = dev->config;
-	res = HAL_SD_Abort(config->hsd);
-	return res;
 }
 
 static int sdhc_stm32_erase_block(const struct device *dev, struct sdhc_data *data) {
@@ -225,7 +183,8 @@ static int sdhc_stm32_erase_block(const struct device *dev, struct sdhc_data *da
 		LOG_ERR("SD Card is busy now");
 		return HAL_ERROR;
 	}
-	return res;
+
+	return res == HAL_OK ? 0 : -EIO;
 }
 
 static uint32_t sdhc_stm32_get_sd_status(SD_HandleTypeDef *hsd, uint32_t card_relative_address, uint32_t *card_status_resp)
@@ -237,7 +196,7 @@ static uint32_t sdhc_stm32_get_sd_status(SD_HandleTypeDef *hsd, uint32_t card_re
 	if (res != HAL_SD_ERROR_NONE)
 	{
 		LOG_ERR("Get Card status failed\n");
-		return res;
+		return -EIO;
 	}
 
 	/* Get SD card status */
@@ -248,11 +207,12 @@ static uint32_t sdhc_stm32_get_sd_status(SD_HandleTypeDef *hsd, uint32_t card_re
 
 static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd, struct sdhc_data *data)
 {
-	int res;
+	int res = 0;
+	uint32_t sdmmc_res = 0U;
 	struct sdhc_stm32_data *dev_data = dev->data;
 	const struct sdhc_stm32_config *config = dev->config;
 
-	 __ASSERT(cmd != NULL, "Command is NULL.");
+	__ASSERT_NO_MSG(cmd != NULL);
 
 	if (k_mutex_lock(&dev_data->bus_mutex, K_MSEC(cmd->timeout_ms))) {
 		return -EBUSY;
@@ -264,17 +224,23 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 
 	switch (cmd->opcode) {
 		case SD_SEND_IF_COND:
-			res = SDMMC_CmdOperCond(config->hsd->Instance);
-			cmd->response[0] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
+			sdmmc_res = SDMMC_CmdOperCond(config->hsd->Instance);
+			if (sdmmc_res != 0U) {
+				res = -EIO;
+			} else {
+				cmd->response[0] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
+			}
 			break;
 
 		case SD_WRITE_SINGLE_BLOCK:
 		case SD_WRITE_MULTIPLE_BLOCK:
+			__ASSERT_NO_MSG(data != NULL);
 			res = sdhc_stm32_write_blocks(dev, data);
 			break;
 
 		case SD_READ_SINGLE_BLOCK:
 		case SD_READ_MULTIPLE_BLOCK:
+			__ASSERT_NO_MSG(data != NULL);
 			res = sdhc_stm32_read_blocks(dev, data);
 			break;
 
@@ -287,28 +253,29 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 			break;
 
 		case SD_SEND_CSD:
-			res = SDMMC_CmdSendCSD(config->hsd->Instance, cmd->arg);
-			if(res == 0){
+			sdmmc_res = SDMMC_CmdSendCSD(config->hsd->Instance, cmd->arg);
+			if(sdmmc_res == 0U){
 				cmd->response[0] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
 				cmd->response[1] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP2);
 				cmd->response[2] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP3);
 				cmd->response[3] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP4);
+			} else {
+				res = -EIO;
 			}
+
 			break;
 
 		case SD_SEND_RELATIVE_ADDR:
-			res = SDMMC_CmdSetRelAdd(config->hsd->Instance, (uint16_t *)&cmd->response);
-			if (res == 0U) {
+			sdmmc_res = SDMMC_CmdSetRelAdd(config->hsd->Instance, (uint16_t *)&cmd->response);
+			if (sdmmc_res == 0U) {
 				/*
 				* Restore RCA by reversing the double 16-bit right shift from
 				* Zephyr subsys and SDMMC_CmdSetRelAdd
 				*/
 				cmd->response[0] = cmd->response[0] << 16;
+			} else {
+				res = -EIO;
 			}
-			break;
-
-		case SD_STOP_TRANSMISSION:
-			res = sdhc_stm32_abort(dev);
 			break;
 
 		case SD_SWITCH:
@@ -316,39 +283,53 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 			break;
 
 		case SD_APP_CMD:
-			res = SDMMC_CmdAppCommand(config->hsd->Instance, cmd->arg);
-			if(res) {
+			sdmmc_res = SDMMC_CmdAppCommand(config->hsd->Instance, cmd->arg);
+			if(sdmmc_res != 0U) {
 				LOG_ERR("Unsupported feature\n");
 				res =  -ENOTSUP;
 			} else {
-			cmd->response[0] =  SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
+				cmd->response[0] =  SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
 			}
 			break;
 
 		case SD_APP_SEND_OP_COND:
-			res = SDMMC_CmdAppOperCommand(config->hsd->Instance, cmd->arg);
-			cmd->response[0] =  SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
+			sdmmc_res = SDMMC_CmdAppOperCommand(config->hsd->Instance, cmd->arg);
+			if(sdmmc_res == 0U) {
+				cmd->response[0] =  SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
+			} else {
+				res = -EIO;
+			}
 			break;
 
 		case SD_ALL_SEND_CID:
-			res = SDMMC_CmdSendCID(config->hsd->Instance);
-			if(res == 0) {
+			sdmmc_res = SDMMC_CmdSendCID(config->hsd->Instance);
+			if(sdmmc_res == 0U) {
 				cmd->response[0] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
 				cmd->response[1] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP2);
 				cmd->response[2] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP3);
 				cmd->response[3] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP4);
+			} else {
+				res = -EIO;
 			}
 			break;
 		case SD_SELECT_CARD:
-			res = SDMMC_CmdSelDesel(config->hsd->Instance, cmd->arg);
+			sdmmc_res = SDMMC_CmdSelDesel(config->hsd->Instance, cmd->arg);
+			if(sdmmc_res == 0U) {
 				cmd->response[0] = SDMMC_GetResponse(config->hsd->Instance, SDMMC_RESP1);
+			} else {
+				res = -EIO;
+			}
 			
 			break;
 		case SD_APP_SEND_SCR:
 			res = SD_FindSCR(config->hsd, data->data);
 			break;
 		case SD_SET_BLOCK_SIZE:
-			res = SDMMC_CmdBlockLength(config->hsd->Instance, (uint32_t)cmd->arg);
+			sdmmc_res = SDMMC_CmdBlockLength(config->hsd->Instance, (uint32_t)cmd->arg);
+			if(sdmmc_res != 0U) {
+				res = -EIO;
+			}
+
 			break;
 		case SD_VOL_SWITCH:
 		    res = sdhc_stm32_switch_to_1_8v(dev);
@@ -358,7 +339,7 @@ static int sdhc_stm32_request(const struct device *dev, struct sdhc_command *cmd
 			res = sdhc_stm32_get_sd_status(config->hsd, cmd->arg, &cmd->response[0]);
 			break;
 		default:
-			res = HAL_ERROR;
+			res = -ENOTSUP;
 			LOG_ERR("Unsupported Command: opcode :%d.", cmd->opcode);
 			break;
 	}
@@ -440,6 +421,10 @@ static int sdhc_stm32_reset(const struct device *dev)
 
 	/* Resetting card */
 	res = sdhc_stm32_go_idle_state(dev);
+	if(res != 0U) {
+		res =-EIO;
+		LOG_ERR("Unable to reset card to Idle state — CMD0 failed");
+	}
 
 	pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 	(void)pm_device_runtime_put(dev);
@@ -635,23 +620,25 @@ static int sdhc_stm32_init(const struct device *dev)
 
 	ret = sdhc_stm32_sd_init(dev);
 	if (ret != 0) {
+		LOG_ERR("SD Init Failed");
 		sdhc_stm32_log_err_type(config->hsd);
 		return ret;
 	}
 
+	LOG_INF("SD Init Passed Successfully");
 	sdhc_stm32_init_props(dev);
 
 	k_mutex_init(&data->bus_mutex);
 	k_sem_init(&data->cmd_sem, 0, K_SEM_MAX_LIMIT);
 
-	config->irq_config_func(dev);
+	config->irq_config_func();
 
 	if (config->cd_gpio.port != NULL) {
 		if (!gpio_is_ready_dt(&config->cd_gpio)) {
 			LOG_ERR("GPIO port for carrier-detect pin is not ready");
 			return -ENODEV;
 		}
-		int ret = gpio_pin_configure_dt(&config->cd_gpio, GPIO_INPUT| GPIO_PULL_UP);
+		int ret = gpio_pin_configure_dt(&config->cd_gpio, GPIO_INPUT);
 		if (ret < 0) {
 			LOG_ERR("Couldn't configure carrier-detect pin; (%d)", ret);
 			return ret;
@@ -714,67 +701,67 @@ static int sdhc_stm32_pm_action(const struct device *dev, enum pm_device_action 
 }
 #endif /* CONFIG_PM_DEVICE */
 
-#define STM32_SDHC_IRQ_CONNECT_AND_ENABLE(index)	\
-	do {	\
-		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(index, event, irq),	\
+#define STM32_SDHC_IRQ_CONNECT_AND_ENABLE(index)						\
+	do {											\
+		IRQ_CONNECT(DT_INST_IRQ_BY_NAME(index, event, irq),				\
 			DT_INST_IRQ_BY_NAME(index, event, priority), sdhc_stm32_event_isr,	\
-			DEVICE_DT_INST_GET(index), 0);	\
-		irq_enable(DT_INST_IRQ_BY_NAME(index, event, irq));	\
+			DEVICE_DT_INST_GET(index), 0);						\
+		irq_enable(DT_INST_IRQ_BY_NAME(index, event, irq));				\
 	} while (false)
 
-#define STM32_SDHC_IRQ_HANDLER_DECL(index)	\
-	static void sdhc_stm32_irq_config_func_##index(const struct device *dev)
+#define STM32_SDHC_IRQ_HANDLER_DECL(index)							\
+	static void sdhc_stm32_irq_config_func_##index(void)
 
 #define STM32_SDHC_IRQ_HANDLER_FUNCTION(index) .irq_config_func = sdhc_stm32_irq_config_func_##index,
 
 #define STM32_SDHC_IRQ_HANDLER(index)	\
-	static void sdhc_stm32_irq_config_func_##index(const struct device *dev)	\
-	{	\
-		STM32_SDHC_IRQ_CONNECT_AND_ENABLE(index);	\
+	static void sdhc_stm32_irq_config_func_##index(void)		\
+	{											\
+		STM32_SDHC_IRQ_CONNECT_AND_ENABLE(index);					\
 	}
 
-#define SDHC_STM32_INIT(index)	\
-	STM32_SDHC_IRQ_HANDLER_DECL(index);	\
-	\
+#define SDHC_STM32_INIT(index)									\
+	STM32_SDHC_IRQ_HANDLER_DECL(index);							\
+												\
 	static const struct stm32_pclken pclken_##index[] = STM32_DT_INST_CLOCKS(index);	\
-	\
-	PINCTRL_DT_INST_DEFINE(index);	\
-	\
-	static SD_HandleTypeDef hsd_##index = {	\
-		.Instance = (MMC_TypeDef *)DT_INST_REG_ADDR(index),	\
-	};	\
-	\
-	static const struct sdhc_stm32_config sdhc_stm32_cfg_##index = {	\
-		STM32_SDHC_IRQ_HANDLER_FUNCTION(index)	\
-		.hsd = &hsd_##index,	\
-		.pclken = pclken_##index,	\
-		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(index),	\
-		.bus_width = DT_INST_PROP(index, bus_width),	\
-		.hw_flow_control= DT_INST_PROP_OR(index, hw_flow_control,0),	\
-		.clk_div= DT_INST_PROP_OR(index, clk_div,4),	\
-		.power_delay_ms = DT_INST_PROP_OR(inst, power_delay_ms, 500),	\
-		.support_1_8_v = DT_INST_PROP(index, support_1_8_v),	\
-		.min_freq = DT_INST_PROP(index, min_bus_freq),	\
-		.max_freq = DT_INST_PROP(index, max_bus_freq),	\
-		.cd_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(index), cd_gpios, {0}),\
-	};	\
-	\
-	static struct sdhc_stm32_data sdhc_stm32_data_##index = {	\
-		.host_io = {	\
-			.bus_width= DT_INST_PROP_OR(index, bus_width, 4),	\
-		}	\
-	};	\
-	\
-	PM_DEVICE_DT_INST_DEFINE(index, sdhc_stm32_pm_action);	\
-	\
-	DEVICE_DT_INST_DEFINE(index,	\
-			&sdhc_stm32_init,	\
-			NULL,	\
-			&sdhc_stm32_data_##index,	\
-			&sdhc_stm32_cfg_##index,	\
-			POST_KERNEL,	\
-			CONFIG_SDHC_INIT_PRIORITY,	\
-			&sdhc_stm32_api);	\
+												\
+	PINCTRL_DT_INST_DEFINE(index);								\
+												\
+	static SD_HandleTypeDef hsd_##index = {							\
+		.Instance = (MMC_TypeDef *)DT_INST_REG_ADDR(index),				\
+	};											\
+												\
+	static const struct sdhc_stm32_config sdhc_stm32_cfg_##index = {			\
+		STM32_SDHC_IRQ_HANDLER_FUNCTION(index)						\
+		.hsd = &hsd_##index,								\
+		.pclken = pclken_##index,							\
+		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(index),					\
+		.bus_width = DT_INST_PROP(index, bus_width),					\
+		.hw_flow_control= DT_INST_PROP_OR(index, hw_flow_control,0),			\
+		.clk_div= DT_INST_PROP_OR(index, clk_div,4),					\
+		.power_delay_ms = DT_INST_PROP_OR(inst, power_delay_ms, 500),			\
+		.support_1_8_v = DT_INST_PROP(index, support_1_8_v),				\
+		.min_freq = DT_INST_PROP(index, min_bus_freq),					\
+		.max_freq = DT_INST_PROP(index, max_bus_freq),					\
+		.cd_gpio = GPIO_DT_SPEC_GET_OR(DT_DRV_INST(index), cd_gpios, {0}),		\
+	};											\
+												\
+	static struct sdhc_stm32_data sdhc_stm32_data_##index = {				\
+		.host_io = {									\
+			.bus_width= DT_INST_PROP_OR(index, bus_width, 4),			\
+		}										\
+	};											\
+												\
+	PM_DEVICE_DT_INST_DEFINE(index, sdhc_stm32_pm_action);					\
+												\
+	DEVICE_DT_INST_DEFINE(index,								\
+			&sdhc_stm32_init,							\
+			NULL,									\
+			&sdhc_stm32_data_##index,						\
+			&sdhc_stm32_cfg_##index,						\
+			POST_KERNEL,								\
+			CONFIG_SDHC_INIT_PRIORITY,						\
+			&sdhc_stm32_api);							\
 	STM32_SDHC_IRQ_HANDLER(index)
 
 DT_INST_FOREACH_STATUS_OKAY(SDHC_STM32_INIT)
