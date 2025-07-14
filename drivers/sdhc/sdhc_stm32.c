@@ -365,41 +365,30 @@ static int sdhc_stm32_get_card_present(const struct device *dev)
 
     int res = 0;
 
-    k_mutex_lock(&dev_data->bus_mutex, K_FOREVER);
-    (void)pm_device_runtime_get(dev);
-    pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
-
     if (config->cd_gpio.port != NULL) {
-        if (!device_is_ready(config->cd_gpio.port)) {
-            LOG_ERR("Card detect GPIO not ready");
-            res = -ENODEV;
-            goto out;
-        }
-        res = gpio_pin_get_dt(&config->cd_gpio);
-        LOG_INF("from gpio %d ",res);
-        
+	    res = gpio_pin_get_dt(&config->cd_gpio);
+		return res;
+
     } else {
+	    k_mutex_lock(&dev_data->bus_mutex, K_FOREVER);
+	    (void)pm_device_runtime_get(dev);
+	    pm_policy_state_lock_get(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
 	    // Try CMD0 or CMD55/ACMD41 (send operation condition)
 	    if (SDMMC_CmdGoIdleState(config->hsd->Instance) != 0) {
-		    LOG_ERR("Card can't go to Idle State");
-		    res = 1;
+		    res = -EIO;
+		    sdhc_stm32_log_err_type(config->hsd);
 	    } else {
 		    if (SDMMC_CmdOperCond(config->hsd->Instance) != 0) {
-			    LOG_ERR("Card not responding to OC");
-			    res = 0; // Not present
-		    } else {
-			    res = 1; // Present
+			    res = -EIO;
+			    sdhc_stm32_log_err_type(config->hsd);
 		    }
 	    }
+	    pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
+	    (void)pm_device_runtime_put(dev);
+	    k_mutex_unlock(&dev_data->bus_mutex);
     }
 
-out:
-
-    pm_policy_state_lock_put(PM_STATE_SUSPEND_TO_IDLE, PM_ALL_SUBSTATES);
-    (void)pm_device_runtime_put(dev);
-    k_mutex_unlock(&dev_data->bus_mutex);
-
-    return res ;
+    return res == 0 ;
 }
 
 static int sdhc_stm32_reset(const struct device *dev)
