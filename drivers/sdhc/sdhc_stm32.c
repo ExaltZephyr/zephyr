@@ -17,6 +17,7 @@
 #include <zephyr/pm/device.h>
 #include <zephyr/pm/device_runtime.h>
 #include <zephyr/pm/policy.h>
+#include <zephyr/cache.h>
 
 
 LOG_MODULE_REGISTER(sdhc_stm32, CONFIG_SDHC_LOG_LEVEL);
@@ -45,6 +46,8 @@ struct sdhc_stm32_data {
 	struct sdhc_io host_io;
 	struct sdhc_host_props props;  /* currect host properties */
 	struct k_sem cmd_sem;
+	void *sd_dma_buf;
+	uint32_t total_transfer_bytes;
 };
 
 void sdhc_stm32_log_err_type(SD_HandleTypeDef *hsd)
@@ -93,13 +96,18 @@ static int sdhc_stm32_write_blocks(const struct device *dev, struct sdhc_data *d
 	const struct sdhc_stm32_config *config = dev->config;
 	__ASSERT(data != NULL, "Data is required for this command.");
 
-	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
-		ret = HAL_SD_WriteBlocks_DMA(config->hsd, data->data, data->block_addr, data->blocks);
+	if (!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)) {
+		sys_cache_data_flush_range(data->data,
+						   data->blocks * data->block_size);
+
+		ret = HAL_SD_WriteBlocks_DMA(config->hsd, data->data, data->block_addr,
+					     data->blocks);
 	} else {
-		ret = HAL_SD_WriteBlocks(config->hsd, data->data, data->block_addr, data->blocks, data->timeout_ms);
+		ret = HAL_SD_WriteBlocks(config->hsd, data->data, data->block_addr, data->blocks,
+					 data->timeout_ms);
 	}
 
-	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
+	if (!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)) {
 		if (k_sem_take(&dev_data->cmd_sem, SDHC_CMD_TIMEOUT) != 0) {
 			LOG_ERR("Failed to acquire Semaphore\n");
 			return -ETIMEDOUT;
@@ -114,17 +122,24 @@ static int sdhc_stm32_read_blocks(const struct device *dev, struct sdhc_data *da
 	struct sdhc_stm32_data *dev_data = dev->data;
 	const struct sdhc_stm32_config *config = dev->config;
 
-	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
-		ret = HAL_SD_ReadBlocks_DMA(config->hsd, data->data, data->block_addr, data->blocks);
+	if (!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)) {
+		// Invalidate cache
+		sys_cache_data_invd_range(data->data, data->blocks * data->block_size);
+
+		ret = HAL_SD_ReadBlocks_DMA(config->hsd, data->data, data->block_addr,
+					    data->blocks);
 	} else {
-		ret = HAL_SD_ReadBlocks(config->hsd, data->data, data->block_addr, data->blocks, data->timeout_ms);
+		ret = HAL_SD_ReadBlocks(config->hsd, data->data, data->block_addr, data->blocks,
+					data->timeout_ms);
 	}
 
-	if(!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)){
+	if (!IS_ENABLED(CONFIG_SDHC_STM32_POLLING_MODE)) {
 		if (k_sem_take(&dev_data->cmd_sem, SDHC_CMD_TIMEOUT) != 0) {
 			LOG_ERR("Failed to acquire Semaphore\n");
 			return -ETIMEDOUT;
 		}
+		// Invalidate again after DMA completes, to ensure fresh read (safe double check)
+		sys_cache_data_invd_range(data->data, data->blocks * data->block_size);
 	}
 
 	return ret == HAL_OK ? 0 : -EIO;
@@ -174,7 +189,7 @@ static int sdhc_stm32_erase_block(const struct device *dev, struct sdhc_data *da
 	struct sdhc_stm32_data *dev_data = dev->data;
 	const struct sdhc_stm32_config *config = dev->config;
 
-	res = HAL_SD_Erase(config->hsd, data->block_addr, (data->block_size + data->block_addr));
+	res = HAL_SD_Erase(config->hsd, data->block_addr, ((data->block_size * data->blocks)+ data->block_addr));
 	if(res != HAL_OK) {
 		return res;
 	}
