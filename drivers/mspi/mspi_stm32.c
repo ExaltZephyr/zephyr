@@ -28,6 +28,8 @@
 LOG_MODULE_REGISTER(mspi_stm32, CONFIG_MSPI_LOG_LEVEL);
 
 #define MSPI_NOR_STM32_NODE DT_CHILD(0)
+#define STM32_XSPI_NODE DT_DRV_INST(0)
+#define STM32_XSPI_BASE_ADDRESS DT_REG_ADDR_BY_IDX(STM32_XSPI_NODE, 1)
 
 /* Get the base address of the flash from the DTS node */
 #define MSPI_STM32_BASE_ADDRESS DT_INST_REG_ADDR(0)
@@ -35,6 +37,165 @@ LOG_MODULE_REGISTER(mspi_stm32, CONFIG_MSPI_LOG_LEVEL);
 #define MSPI_STM32_RESET_GPIO DT_INST_NODE_HAS_PROP(0, reset_gpios)
 
 #include "mspi_stm32.h"
+
+/**
+ * @brief Check if the flash is currently operating in memory-mapped mode.
+ */
+static bool stm32_xspi_is_memorymap(const struct device *dev)
+{
+	struct mspi_stm32_data *dev_data = dev->data;
+
+	return READ_BIT(dev_data->hmspi.Instance->CR, XSPI_CR_FMODE) == XSPI_CR_FMODE;
+}
+
+static uint32_t mspi_stm32_hal_address_size(uint8_t address_length)
+{
+	if (address_length == 4U) {
+		return HAL_XSPI_ADDRESS_32_BITS;
+	}
+
+	return HAL_XSPI_ADDRESS_24_BITS;
+}
+
+/* Set the device back in indirect mode */
+static int mspi_stm32_memmap_off(const struct device *controller)
+{
+	struct mspi_stm32_data *dev_data = controller->data;
+
+	if (HAL_XSPI_Abort(&dev_data->hmspi) != HAL_OK) {
+		LOG_ERR("MemMapped abort failed: %x\n",dev_data->hmspi.ErrorCode);
+		return -EIO;
+	}
+	return 0;
+}
+
+static XSPI_RegularCmdTypeDef mspi_stm32_prepare_cmd(uint8_t cfg_mode, uint8_t cfg_rate);
+
+/* Set the device in Memory-Mapped mode */
+static int mspi_stm32_memmap_on(const struct device *controller)
+{
+	int ret;
+	struct mspi_stm32_data *dev_data = controller->data;
+	XSPI_MemoryMappedTypeDef s_MemMappedCfg;
+
+	dev_data->ctx.xfer.addr_length = 4;
+	if(stm32_xspi_is_memorymap(controller)) {
+		return 0;
+	}
+
+	/* Configure in MemoryMapped mode */
+	if ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE) &&
+
+	    (mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length) ==
+	     HAL_XSPI_ADDRESS_24_BITS)) {
+		/* OPI mode and 3-bytes address size not supported by memory */
+		LOG_ERR("MSPI_IO_MODE_SINGLE in 3Bytes addressing is not supported");
+		return -EIO;
+	}
+
+	XSPI_RegularCmdTypeDef s_command =mspi_stm32_prepare_cmd(dev_data->dev_cfg.io_mode, dev_data->dev_cfg.data_rate);
+
+	/* Initialize the read command */
+	s_command.OperationType = HAL_XSPI_OPTYPE_READ_CFG;
+	s_command.InstructionMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					    ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						       ? HAL_XSPI_INSTRUCTION_1_LINE
+						       : HAL_XSPI_INSTRUCTION_8_LINES)
+					    : HAL_XSPI_INSTRUCTION_8_LINES;
+	s_command.InstructionDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					       ? HAL_XSPI_INSTRUCTION_DTR_DISABLE
+					       : HAL_XSPI_INSTRUCTION_DTR_ENABLE;
+	s_command.InstructionWidth = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+							? HAL_XSPI_INSTRUCTION_8_BITS
+							: HAL_XSPI_INSTRUCTION_16_BITS)
+					     : HAL_XSPI_INSTRUCTION_16_BITS;
+	s_command.Instruction = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						   ? ((mspi_stm32_hal_address_size(
+							       dev_data->ctx.xfer.addr_length) ==
+						       HAL_XSPI_ADDRESS_24_BITS)
+							      ? MSPI_STM32_CMD_READ_FAST
+							      : MSPI_STM32_CMD_READ_FAST_4B)
+						   : dev_data->dev_cfg.read_cmd)
+					: MSPI_STM32_OCMD_DTR_RD;
+	s_command.AddressMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						   ? HAL_XSPI_ADDRESS_1_LINE
+						   : HAL_XSPI_ADDRESS_8_LINES)
+					: HAL_XSPI_ADDRESS_8_LINES;
+	s_command.AddressDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					   ? HAL_XSPI_ADDRESS_DTR_DISABLE
+					   : HAL_XSPI_ADDRESS_DTR_ENABLE;
+	s_command.AddressWidth =
+		(dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+			? mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length)
+			: HAL_XSPI_ADDRESS_32_BITS;
+	s_command.DataMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+				     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						? HAL_XSPI_DATA_1_LINE
+						: HAL_XSPI_DATA_8_LINES)
+				     : HAL_XSPI_DATA_8_LINES;
+	s_command.DataDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					? HAL_XSPI_DATA_DTR_DISABLE
+					: HAL_XSPI_DATA_DTR_ENABLE;
+	s_command.DummyCycles = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						   ? MSPI_STM32_DUMMY_RD
+						   : MSPI_STM32_DUMMY_RD_OCTAL)
+					: MSPI_STM32_DUMMY_RD_OCTAL_DTR;
+	s_command.DQSMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+				    ? HAL_XSPI_DQS_DISABLE
+				    : HAL_XSPI_DQS_ENABLE;
+
+	#ifdef XSPI_CCR_SIOO
+		s_command.SIOOMode = HAL_XSPI_SIOO_INST_EVERY_CMD;
+	#endif /* XSPI_CCR_SIOO */
+
+	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	if (ret != HAL_OK) {
+		LOG_ERR("Failed to set memory mapped mode");
+		return -EIO;
+	}
+
+	/* Initialize the program command */
+	s_command.OperationType = HAL_XSPI_OPTYPE_WRITE_CFG;
+	if (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE) {
+		s_command.Instruction =
+			(dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+				? ((mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length) ==
+				    HAL_XSPI_ADDRESS_24_BITS)
+					   ? MSPI_STM32_CMD_PP
+					   : MSPI_STM32_CMD_PP_4B)
+				: MSPI_STM32_OCMD_PAGE_PRG;
+	} else {
+		s_command.Instruction = MSPI_STM32_OCMD_PAGE_PRG;
+	}
+
+	s_command.DQSMode = HAL_XSPI_DQS_DISABLE;
+	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	if (ret != HAL_OK) {
+		LOG_ERR("Failed to set memory mapped mode");
+		return -EIO;
+	}
+
+	#ifdef XSPI_CR_NOPREF
+		s_MemMappedCfg.NoPrefetchData = HAL_XSPI_AUTOMATIC_PREFETCH_ENABLE;
+	#ifdef XSPI_CR_NOPREF_AXI
+		s_MemMappedCfg.NoPrefetchAXI = HAL_XSPI_AXI_PREFETCH_DISABLE;
+	#endif /* XSPI_CR_NOPREF_AXI */
+	#endif /* XSPI_CR_NOPREF */
+
+	/* Enable the memory-mapping */
+	s_MemMappedCfg.TimeOutActivation = HAL_XSPI_TIMEOUT_COUNTER_DISABLE;
+	ret = HAL_XSPI_MemoryMapped(&dev_data->hmspi, &s_MemMappedCfg);
+	if (ret != HAL_OK) {
+		LOG_ERR("Failed to enable memory mapped mode");
+		return -EIO;
+	}
+
+	return 0;
+}
 
 static inline void mspi_context_release(struct mspi_context *ctx)
 {
@@ -97,15 +258,6 @@ static inline bool mspi_is_inp(const struct device *controller)
 	struct mspi_stm32_data *dev_data = controller->data;
 
 	return (k_sem_count_get(&dev_data->ctx.lock) == 0);
-}
-
-static uint32_t mspi_stm32_hal_address_size(uint8_t address_length)
-{
-	if (address_length == 4U) {
-		return HAL_XSPI_ADDRESS_32_BITS;
-	}
-
-	return HAL_XSPI_ADDRESS_24_BITS;
 }
 
 /**
@@ -191,6 +343,48 @@ static int mspi_stm32_access(const struct device *dev, const struct mspi_xfer_pa
 {
 	struct mspi_stm32_data *dev_data = dev->data;
 	HAL_StatusTypeDef hal_ret;
+
+	#ifdef CONFIG_STM32_MEMMAP
+	ARG_UNUSED(access_mode);
+		if(packet->dir == MSPI_RX) {
+			if (packet->data_buf == NULL) {
+				LOG_ERR("MSPI READ failed: destination buffer is NULL");
+				goto e_access;
+			}
+
+			if (!stm32_xspi_is_memorymap(dev)) {
+				hal_ret = mspi_stm32_memmap_on(dev);
+				if (hal_ret != 0) {
+					LOG_ERR("Failed to set memory mapped");
+					goto e_access;
+				}
+			}
+
+			__ASSERT_NO_MSG(stm32_xspi_is_memorymap(dev));
+
+			uintptr_t mmap_addr = STM32_XSPI_BASE_ADDRESS + packet->address;
+			LOG_INF("Memory-mapped read from 0x%08lx, len %zu\n", mmap_addr, packet->num_bytes);
+			memcpy(packet->data_buf, (void *)mmap_addr, packet->num_bytes);
+
+			printf("/////data after:\n");
+			for (size_t i = 0; i < packet->num_bytes; i++) {
+				printk("%02X ", packet->data_buf[i]); // print each byte in hex
+			}
+			printk("\n");
+			goto e_access;
+		} else {
+			ARG_UNUSED(packet);
+			if (stm32_xspi_is_memorymap(dev)) {
+				/* Abort ongoing transfer to force CS high/BUSY deasserted */
+				hal_ret = mspi_stm32_memmap_off(dev);
+				if (hal_ret != 0) {
+					LOG_ERR("Failed to abort memory-mapped access before write");
+					goto e_access;
+				}
+			}
+		}
+	#endif
+
 	XSPI_RegularCmdTypeDef cmd =
 		mspi_stm32_prepare_cmd(dev_data->dev_cfg.io_mode, dev_data->dev_cfg.data_rate);
 
@@ -982,129 +1176,6 @@ e_return:
 	return ret;
 }
 
-/* Set the device back in command mode */
-static int mspi_stm32_memmap_off(const struct device *controller)
-{
-	struct mspi_stm32_data *dev_data = controller->data;
-
-	if (HAL_XSPI_Abort(&dev_data->hmspi) != HAL_OK) {
-		LOG_ERR("MemMapped abort failed");
-		return -EIO;
-	}
-	return 0;
-}
-
-/* Set the device in MemMapped mode */
-static int mspi_stm32_memmap_on(const struct device *controller)
-{
-	struct mspi_stm32_data *dev_data = controller->data;
-	XSPI_RegularCmdTypeDef s_command;
-	XSPI_MemoryMappedTypeDef s_MemMappedCfg;
-	int ret;
-
-	/* Configure in MemoryMapped mode */
-	if ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE) &&
-
-	    (mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length) ==
-	     HAL_XSPI_ADDRESS_24_BITS)) {
-		/* OPI mode and 3-bytes address size not supported by memory */
-		LOG_ERR("MSPI_IO_MODE_SINGLE in 3Bytes addressing is not supported");
-		return -EIO;
-	}
-
-	/* Initialize the read command */
-	s_command.OperationType = HAL_XSPI_OPTYPE_READ_CFG;
-	s_command.InstructionMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					    ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						       ? HAL_XSPI_INSTRUCTION_1_LINE
-						       : HAL_XSPI_INSTRUCTION_8_LINES)
-					    : HAL_XSPI_INSTRUCTION_8_LINES;
-	s_command.InstructionDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					       ? HAL_XSPI_INSTRUCTION_DTR_DISABLE
-					       : HAL_XSPI_INSTRUCTION_DTR_ENABLE;
-	s_command.InstructionWidth = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-							? HAL_XSPI_INSTRUCTION_8_BITS
-							: HAL_XSPI_INSTRUCTION_16_BITS)
-					     : HAL_XSPI_INSTRUCTION_16_BITS;
-	s_command.Instruction = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						   ? ((mspi_stm32_hal_address_size(
-							       dev_data->ctx.xfer.addr_length) ==
-						       HAL_XSPI_ADDRESS_24_BITS)
-							      ? MSPI_STM32_CMD_READ_FAST
-							      : MSPI_STM32_CMD_READ_FAST_4B)
-						   : dev_data->dev_cfg.read_cmd)
-					: MSPI_STM32_OCMD_DTR_RD;
-	s_command.AddressMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						   ? HAL_XSPI_ADDRESS_1_LINE
-						   : HAL_XSPI_ADDRESS_8_LINES)
-					: HAL_XSPI_ADDRESS_8_LINES;
-	s_command.AddressDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					   ? HAL_XSPI_ADDRESS_DTR_DISABLE
-					   : HAL_XSPI_ADDRESS_DTR_ENABLE;
-	s_command.AddressWidth =
-		(dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-			? mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length)
-			: HAL_XSPI_ADDRESS_32_BITS;
-	s_command.DataMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-				     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						? HAL_XSPI_DATA_1_LINE
-						: HAL_XSPI_DATA_8_LINES)
-				     : HAL_XSPI_DATA_8_LINES;
-	s_command.DataDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? HAL_XSPI_DATA_DTR_DISABLE
-					: HAL_XSPI_DATA_DTR_ENABLE;
-	s_command.DummyCycles = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						   ? MSPI_STM32_DUMMY_RD
-						   : MSPI_STM32_DUMMY_RD_OCTAL)
-					: MSPI_STM32_DUMMY_RD_OCTAL_DTR;
-	s_command.DQSMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-				    ? HAL_XSPI_DQS_DISABLE
-				    : HAL_XSPI_DQS_ENABLE;
-#ifdef XSPI_CCR_SIOO
-	s_command.SIOOMode = HAL_XSPI_SIOO_INST_EVERY_CMD;
-#endif /* XSPI_CCR_SIOO */
-
-	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
-	if (ret != HAL_OK) {
-		LOG_ERR("Failed to set memory map");
-		return -EIO;
-	}
-
-	/* Initialize the program command */
-	s_command.OperationType = HAL_XSPI_OPTYPE_WRITE_CFG;
-	if (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE) {
-		s_command.Instruction =
-			(dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-				? ((mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length) ==
-				    HAL_XSPI_ADDRESS_24_BITS)
-					   ? MSPI_STM32_CMD_PP
-					   : MSPI_STM32_CMD_PP_4B)
-				: MSPI_STM32_OCMD_PAGE_PRG;
-	} else {
-		s_command.Instruction = MSPI_STM32_OCMD_PAGE_PRG;
-	}
-	s_command.DQSMode = HAL_XSPI_DQS_DISABLE;
-	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
-	if (ret != HAL_OK) {
-		LOG_ERR("Failed to set memory mapped");
-		return -EIO;
-	}
-
-	/* Enable the memory-mapping */
-	s_MemMappedCfg.TimeOutActivation = HAL_XSPI_TIMEOUT_COUNTER_DISABLE;
-	ret = HAL_XSPI_MemoryMapped(&dev_data->hmspi, &s_MemMappedCfg);
-	if (ret != HAL_OK) {
-		LOG_ERR("Failed to enable memory mapped");
-		return -EIO;
-	}
-
-	return 0;
-}
-
 /**
  * API implementation of mspi_xip_config : XIP configuration
  *
@@ -1551,7 +1622,22 @@ static int mspi_stm32_config(const struct mspi_dt_spec *spec)
 		LOG_ERR("clock control device not ready");
 		return -ENODEV;
 	}
-
+	#ifdef CONFIG_STM32_MEMMAP || CONFIG_STM32_APP_IN_EXT_FLASH
+		/* If MemoryMapped then configure skip init
+		* Check clock status first as reading CR register without bus clock doesn't work on N6
+		* If clock is off, then MemoryMapped is off too and we do init
+		// */
+		if (clock_control_get_status(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
+					(clock_control_subsys_t) &dev_cfg->pclken)
+					== CLOCK_CONTROL_STATUS_ON) {
+			if (stm32_xspi_is_memorymap(&spec->bus)) {
+				LOG_ERR("NOR init'd in MemMapped mode");
+				/* Force HAL instance in correct state */
+				dev_data->hmspi.State = HAL_XSPI_STATE_BUSY_MEM_MAPPED;
+				return 0;
+			}
+		}
+	#endif
 	/* Max 3 domain clock are expected */
 	if (dev_cfg->pclk_len > 3) {
 		LOG_ERR("Could not select %d XSPI domain clock", dev_cfg->pclk_len);
