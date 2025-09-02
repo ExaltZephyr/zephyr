@@ -9,3 +9,4 @@ zephyr_library_sources_ifdef(CONFIG_MSPI_AMBIQ_TIMING_SCAN mspi_ambiq_timing_sca
 zephyr_library_sources_ifdef(CONFIG_MSPI_DW          mspi_dw.c)
 zephyr_library_sources_ifdef(CONFIG_MSPI_EMUL        mspi_emul.c)
 zephyr_library_sources_ifdef(CONFIG_MSPI_STM32       mspi_stm32.c)
+zephyr_library_sources_ifdef(CONFIG_OSPI_STM32       ospi_stm32.c)
