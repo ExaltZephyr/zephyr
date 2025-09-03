@@ -23,13 +23,15 @@
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/mspi.h>
 #include <zephyr/irq.h>
-
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(mspi_stm32, CONFIG_MSPI_LOG_LEVEL);
 
 #define MSPI_NOR_STM32_NODE DT_CHILD(0)
 #define STM32_XSPI_NODE DT_DRV_INST(0)
 #define STM32_XSPI_BASE_ADDRESS DT_REG_ADDR_BY_IDX(STM32_XSPI_NODE, 1)
+
+#define SPI_NOR_OCMD_DTR_RD     0xEE11  /* Octal IO DTR read command */
+#define SPI_NOR_OCMD_RD         0xEC13  /* Octal IO read command */
 
 /* Get the base address of the flash from the DTS node */
 #define MSPI_STM32_BASE_ADDRESS DT_INST_REG_ADDR(0)
@@ -409,6 +411,12 @@ static int mspi_stm32_access(const struct device *dev, const struct mspi_xfer_pa
 	LOG_DBG("MSPI access Instruction 0x%x", cmd.Instruction);
 
 	dev_data->cmd_status = 0;
+
+	if((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_OCTAL) && (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_DUAL)) {
+		if((packet->dir ==MSPI_RX) && (packet->cmd == SPI_NOR_OCMD_RD)) {
+			cmd.Instruction = SPI_NOR_OCMD_DTR_RD;
+		}
+	}
 
 	hal_ret = HAL_XSPI_Command(&dev_data->hmspi, &cmd, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
 	if (hal_ret != HAL_OK) {
@@ -803,7 +811,7 @@ static int mspi_stm32_config_mem(const struct device *dev, uint8_t cfg_mode, uin
 	}
 
 	/* Write Configuration register 2 (with Octal I/O SPI protocol : choose STR or DTR) */
-	uint8_t mode_enable = ((cfg_mode == MSPI_DATA_RATE_DUAL)
+	uint8_t mode_enable = ((cfg_rate == MSPI_DATA_RATE_DUAL)
 			? MSPI_STM32_CR2_DTR_OPI_EN
 			: MSPI_STM32_CR2_STR_OPI_EN);
 	if (mspi_stm32_write_cfg2reg_io(dev, MSPI_IO_MODE_SINGLE, MSPI_DATA_RATE_SINGLE,
@@ -1144,13 +1152,13 @@ static int mspi_stm32_dev_config(const struct device *controller, const struct m
 		return ret;
 	}
 
-	if (param_mask & MSPI_DEVICE_CONFIG_DATA_RATE) {
-		/* TODO: add support for DTR */
-		if (dev_cfg->data_rate != MSPI_DATA_RATE_SINGLE) {
-			LOG_ERR("Only single data rate is supported.");
-			return -ENOTSUP;
-		}
-	}
+	// if (param_mask & MSPI_DEVICE_CONFIG_DATA_RATE) {
+	// 	/* TODO: add support for DTR */
+	// 	if (dev_cfg->data_rate != MSPI_DATA_RATE_SINGLE) {
+	// 		LOG_ERR("Only single data rate is supported.");
+	// 		return -ENOTSUP;
+	// 	}
+	// }
 
 	/* Proceed step by step in configuration */
 	if (param_mask & (MSPI_DEVICE_CONFIG_IO_MODE | MSPI_DEVICE_CONFIG_DATA_RATE)) {
