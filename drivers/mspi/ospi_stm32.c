@@ -30,6 +30,8 @@ LOG_MODULE_REGISTER(ospi_stm32, CONFIG_MSPI_LOG_LEVEL);
 #define MSPI_NOR_STM32_NODE DT_CHILD(0)
 #define STM32_OSPI_NODE DT_DRV_INST(0)
 
+#define SPI_NOR_OCMD_DTR_RD     0xEE11  /* Octal IO DTR read command */
+#define SPI_NOR_OCMD_RD         0xEC13  /* Octal IO read command */
 
 /* Get the base address of the flash from the DTS node */
 #define MSPI_STM32_BASE_ADDRESS DT_INST_REG_ADDR(0)
@@ -276,11 +278,7 @@ static int mspi_stm32_memmap_on(const struct device *controller)
 	s_command.DataDtrMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
 					? HAL_OSPI_DATA_DTR_DISABLE
 					: HAL_OSPI_DATA_DTR_ENABLE;
-	s_command.DummyCycles = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						   ? MSPI_STM32_DUMMY_RD
-						   : MSPI_STM32_DUMMY_RD_OCTAL)
-					: MSPI_STM32_DUMMY_RD_OCTAL_DTR;
+	s_command.DummyCycles = dev_data->ctx.xfer.rx_dummy;
 	s_command.DQSMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
 				    ? HAL_OSPI_DQS_DISABLE
 				    : HAL_OSPI_DQS_ENABLE;
@@ -359,6 +357,39 @@ static int mspi_stm32_access(const struct device *dev, const struct mspi_xfer_pa
 	LOG_DBG("MSPI access Instruction 0x%x", cmd.Instruction);
 
 	dev_data->cmd_status = 0;
+	
+	if ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_OCTAL) &&
+	    (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_DUAL)) {
+		if ((packet->dir == MSPI_RX) && (packet->cmd == SPI_NOR_OCMD_RD)) {
+			cmd.Instruction = SPI_NOR_OCMD_DTR_RD;
+		}
+	}
+
+#if defined(CONFIG_MSPI_XIP)
+	if (mspi_stm32_is_memorymap(dev) && packet->dir == MSPI_TX) {
+
+		hal_ret = mspi_stm32_memmap_off(dev);
+		if (hal_ret != 0) {
+			LOG_ERR("Failed to abort mempry-mapped before write");
+			goto end;
+		} else {
+			LOG_INF("Memory mapped mode is Aborted");
+		}
+
+	} else if (packet->dir == MSPI_RX && dev_data->dev_cfg.io_mode != MSPI_IO_MODE_SINGLE) {
+		if (!mspi_stm32_is_memorymap(dev)) {
+			hal_ret = mspi_stm32_memmap_on(dev);
+			if (hal_ret != 0) {
+				LOG_ERR("Failed to set mempry-mapped before read");
+				goto end;
+			}
+		}
+		//LOG_INF("MemoryMapped Read offset: 0x%lx, len: %zu  is mem %d",(long)(STM32_OSPI_BASE_ADDRESS + packet->address),packet->num_bytes,mspi_stm32_is_memorymap(dev));
+		memcpy(packet->data_buf, (uint8_t *)STM32_OSPI_BASE_ADDRESS + packet->address, packet->num_bytes);
+		//LOG_INF("DONE MEMCPY");
+		goto end;
+	}
+#endif
 
 	hal_ret = HAL_OSPI_Command(&dev_data->hmspi, &cmd, HAL_OSPI_TIMEOUT_DEFAULT_VALUE);
 	if (hal_ret != HAL_OK) {
@@ -372,6 +403,8 @@ static int mspi_stm32_access(const struct device *dev, const struct mspi_xfer_pa
 	}
 
 	if (packet->dir == MSPI_RX) {	
+		
+		LOG_INF("Instruction  0x%02x", cmd.Instruction);
 		/* Receive the data */
 		switch (access_mode) {
 		case MSPI_ACCESS_SYNC:
@@ -642,6 +675,15 @@ static int mspi_stm32_write_cfg2reg_dummy(const struct device *dev, uint8_t cfg_
 {
 
 	int ret =0;
+#if defined(CONFIG_MSPI_XIP)
+	if (mspi_stm32_is_memorymap(dev)) {
+		ret = mspi_stm32_memmap_off(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to abort mempry-mapped before write %d , is mapped? %d  ", ret,mspi_stm32_is_memorymap(dev));
+			//goto end_write;
+		}
+	}
+#endif
 	struct mspi_stm32_data *dev_data = dev->data;
 	uint8_t transmit_data = MSPI_STM32_CR2_DUMMY_CYCLES_66MHZ;
 	OSPI_RegularCmdTypeDef s_command = mspi_stm32_prepare_cmd(cfg_mode, cfg_rate);
@@ -794,8 +836,9 @@ static int mspi_stm32_config_mem(const struct device *dev, uint8_t cfg_mode, uin
 		return -EIO;
 	}
 
-	LOG_INF("OSPI flash config is OCTO / %s",
-		((cfg_rate == MSPI_DATA_RATE_SINGLE) ? (char *)"STR" : (char *)"DTR"));
+	LOG_INF("OSPI flash config is OCTO / %s", ((cfg_rate == MSPI_DATA_RATE_SINGLE) ?
+		(char *)"STR" :
+		(char *)"DTR"));
 
 	return 0;
 }
@@ -1103,13 +1146,13 @@ static int mspi_stm32_dev_config(const struct device *controller, const struct m
 		return ret;
 	}
 
-	if (param_mask & MSPI_DEVICE_CONFIG_DATA_RATE) {
-		/* TODO: add support for DTR */
-		if (dev_cfg->data_rate != MSPI_DATA_RATE_SINGLE) {
-			LOG_ERR("Only single data rate is supported.");
-			return -ENOTSUP;
-		}
-	}
+	// if (param_mask & MSPI_DEVICE_CONFIG_DATA_RATE) {
+	// 	/* TODO: add support for DTR */
+	// 	if (dev_cfg->data_rate != MSPI_DATA_RATE_SINGLE) {
+	// 		LOG_ERR("Only single data rate is supported.");
+	// 		return -ENOTSUP;
+	// 	}
+	// }
 
 	/* Proceed step by step in configuration */
 	if (param_mask & (MSPI_DEVICE_CONFIG_IO_MODE | MSPI_DEVICE_CONFIG_DATA_RATE)) {
