@@ -54,6 +54,8 @@
 #define MSPI_STM32_CMD_RDPD         0xAB /* Release from Deep Power Down */
 #define MSPI_STM32_CMD_RD_CFGREG2   0x71 /* Read config register 2 */
 #define MSPI_STM32_CMD_WR_CFGREG2   0x72 /* Write config register 2 */
+#define MSPI_STM32_CMD_SE           0x20 /* Sector erase */
+#define MSPI_STM32_CMD_SE_4B        0x21 /* Sector erase 4 byte address*/
 
 #define MSPI_STM32_OCMD_RDSR       0x05FA /* Octal Read status register */
 #define MSPI_STM32_OCMD_RD         0xEC13 /* Octal IO read command */
@@ -62,6 +64,7 @@
 #define MSPI_STM32_OCMD_DTR_RD     0xEE11 /* Octal IO DTR read command */
 #define MSPI_STM32_OCMD_WR_CFGREG2 0x728D /* Octal Write configuration Register2 */
 #define MSPI_STM32_OCMD_RD_CFGREG2 0x718E /* Octal Read configuration Register2 */
+#define MSPI_STM32_OCMD_SE         0x21DE  /* Octal Sector erase */
 
 /* Value to poll the status bus register corresponding to the NOR_MX_STATUS_xxx */
 #define MSPI_STM32_STATUS_MEM_RDY    1
@@ -102,7 +105,7 @@ enum mspi_access_mode {
 };
 
 struct mspi_context {
-	const struct mspi_dev_id *owner;
+	//const struct mspi_dev_id *owner;
 
 	struct mspi_xfer xfer;
 
@@ -117,40 +120,23 @@ struct mspi_context {
 };
 
 struct mspi_stm32_conf {
-	const struct stm32_pclken *pclken;
 	size_t pclk_len;
 	irq_config_func_t irq_config;
-	uint32_t reg_base;
-	uint32_t reg_size;
-
 	struct mspi_cfg mspicfg;
+	const struct stm32_pclken *pclken;
 	const struct pinctrl_dev_config *pcfg;
-#if MSPI_STM32_RESET_GPIO
-	const struct gpio_dt_spec reset;
-#endif /* MSPI_STM32_RESET_GPIO */
 };
 
 /* mspi data includes the controller specific config variable */
 struct mspi_stm32_data {
-	/* XSPI handle is modifiable ; so part of data struct */
 	XSPI_HandleTypeDef hmspi;
+	uint32_t memmap_base_addr;
+	struct mspi_context ctx;
 	struct mspi_dev_id *dev_id;
-
-	/* controller access mutex */
 	struct k_mutex lock;
 	struct k_sem sync;
-
 	struct mspi_dev_cfg dev_cfg;
 	struct mspi_xip_cfg xip_cfg;
-	struct mspi_scramble_cfg scramble_cfg;
-	/* Timing configurations */
-	struct mspi_timing_cfg timing_cfg;
-
-	mspi_callback_handler_t cbs[MSPI_BUS_EVENT_MAX];
-	struct mspi_callback_context *cb_ctxs[MSPI_BUS_EVENT_MAX];
-
-	struct mspi_context ctx;
-	int cmd_status;
 };
 
 #endif /* ZEPHYR_DRIVERS_MSPI_STM32_H_ */

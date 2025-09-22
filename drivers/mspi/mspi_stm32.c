@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025 STMicroelectronics
+ * Copyright (c) 2025 EXALT Technologies.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -8,47 +8,20 @@
  * **************************************************************************
  * MSPI flash controller driver for stm32 serie with multi-SPI periherals
  * This driver is based on the stm32Cube HAL XSPI driver
- * with one mspi DTS NODE
  * **************************************************************************
  */
 #define DT_DRV_COMPAT st_stm32_mspi_controller
 
-#include <errno.h>
-#include <zephyr/kernel.h>
-#include <soc.h>
 #include <zephyr/drivers/pinctrl.h>
 #include <zephyr/drivers/clock_control/stm32_clock_control.h>
 #include <zephyr/drivers/clock_control.h>
 #include <zephyr/drivers/flash.h>
-#include <zephyr/drivers/gpio.h>
 #include <zephyr/drivers/mspi.h>
-#include <zephyr/irq.h>
 #include <zephyr/logging/log.h>
-LOG_MODULE_REGISTER(mspi_stm32, CONFIG_MSPI_LOG_LEVEL);
-
-#define MSPI_NOR_STM32_NODE DT_CHILD(0)
-#define STM32_XSPI_NODE DT_DRV_INST(0)
-#define STM32_XSPI_BASE_ADDRESS DT_REG_ADDR_BY_IDX(STM32_XSPI_NODE, 1)
-
-#define SPI_NOR_OCMD_DTR_RD     0xEE11  /* Octal IO DTR read command */
-#define SPI_NOR_OCMD_RD         0xEC13  /* Octal IO read command */
-
-/* Get the base address of the flash from the DTS node */
-#define MSPI_STM32_BASE_ADDRESS DT_INST_REG_ADDR(0)
-
-#define MSPI_STM32_RESET_GPIO DT_INST_NODE_HAS_PROP(0, reset_gpios)
-
+#include <zephyr/irq.h>
 #include "mspi_stm32.h"
 
-/**
- * @brief Check if the flash is currently operating in memory-mapped mode.
- */
-static bool stm32_xspi_is_memorymap(const struct device *dev)
-{
-	struct mspi_stm32_data *dev_data = dev->data;
-
-	return READ_BIT(dev_data->hmspi.Instance->CR, XSPI_CR_FMODE) == XSPI_CR_FMODE;
-}
+LOG_MODULE_REGISTER(mspi_stm32, CONFIG_MSPI_LOG_LEVEL);
 
 static uint32_t mspi_stm32_hal_address_size(uint8_t address_length)
 {
@@ -59,231 +32,8 @@ static uint32_t mspi_stm32_hal_address_size(uint8_t address_length)
 	return HAL_XSPI_ADDRESS_24_BITS;
 }
 
-/* Set the device back in indirect mode */
-static int mspi_stm32_memmap_off(const struct device *controller)
-{
-	struct mspi_stm32_data *dev_data = controller->data;
-
-	if (HAL_XSPI_Abort(&dev_data->hmspi) != HAL_OK) {
-		LOG_ERR("MemMapped abort failed: %x\n",dev_data->hmspi.ErrorCode);
-		return -EIO;
-	}
-	return 0;
-}
-
-static XSPI_RegularCmdTypeDef mspi_stm32_prepare_cmd(uint8_t cfg_mode, uint8_t cfg_rate);
-
-/* Set the device in Memory-Mapped mode */
-static int mspi_stm32_memmap_on(const struct device *controller)
-{
-	int ret;
-	struct mspi_stm32_data *dev_data = controller->data;
-	XSPI_MemoryMappedTypeDef s_MemMappedCfg;
-
-	dev_data->ctx.xfer.addr_length = 4;
-	if(stm32_xspi_is_memorymap(controller)) {
-		return 0;
-	}
-
-	/* Configure in MemoryMapped mode */
-	if ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE) &&
-
-	    (mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length) ==
-	     HAL_XSPI_ADDRESS_24_BITS)) {
-		/* OPI mode and 3-bytes address size not supported by memory */
-		LOG_ERR("MSPI_IO_MODE_SINGLE in 3Bytes addressing is not supported");
-		return -EIO;
-	}
-
-	XSPI_RegularCmdTypeDef s_command =mspi_stm32_prepare_cmd(dev_data->dev_cfg.io_mode, dev_data->dev_cfg.data_rate);
-
-	/* Initialize the read command */
-	s_command.OperationType = HAL_XSPI_OPTYPE_READ_CFG;
-	s_command.InstructionMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					    ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						       ? HAL_XSPI_INSTRUCTION_1_LINE
-						       : HAL_XSPI_INSTRUCTION_8_LINES)
-					    : HAL_XSPI_INSTRUCTION_8_LINES;
-	s_command.InstructionDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					       ? HAL_XSPI_INSTRUCTION_DTR_DISABLE
-					       : HAL_XSPI_INSTRUCTION_DTR_ENABLE;
-	s_command.InstructionWidth = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-							? HAL_XSPI_INSTRUCTION_8_BITS
-							: HAL_XSPI_INSTRUCTION_16_BITS)
-					     : HAL_XSPI_INSTRUCTION_16_BITS;
-	s_command.Instruction = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						   ? ((mspi_stm32_hal_address_size(
-							       dev_data->ctx.xfer.addr_length) ==
-						       HAL_XSPI_ADDRESS_24_BITS)
-							      ? MSPI_STM32_CMD_READ_FAST
-							      : MSPI_STM32_CMD_READ_FAST_4B)
-						   : dev_data->dev_cfg.read_cmd)
-					: MSPI_STM32_OCMD_DTR_RD;
-	s_command.AddressMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						   ? HAL_XSPI_ADDRESS_1_LINE
-						   : HAL_XSPI_ADDRESS_8_LINES)
-					: HAL_XSPI_ADDRESS_8_LINES;
-	s_command.AddressDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					   ? HAL_XSPI_ADDRESS_DTR_DISABLE
-					   : HAL_XSPI_ADDRESS_DTR_ENABLE;
-	s_command.AddressWidth =
-		(dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-			? mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length)
-			: HAL_XSPI_ADDRESS_32_BITS;
-	s_command.DataMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-				     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						? HAL_XSPI_DATA_1_LINE
-						: HAL_XSPI_DATA_8_LINES)
-				     : HAL_XSPI_DATA_8_LINES;
-	s_command.DataDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? HAL_XSPI_DATA_DTR_DISABLE
-					: HAL_XSPI_DATA_DTR_ENABLE;
-	s_command.DummyCycles = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-						   ? MSPI_STM32_DUMMY_RD
-						   : MSPI_STM32_DUMMY_RD_OCTAL)
-					: MSPI_STM32_DUMMY_RD_OCTAL_DTR;
-	s_command.DQSMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
-				    ? HAL_XSPI_DQS_DISABLE
-				    : HAL_XSPI_DQS_ENABLE;
-
-	#ifdef XSPI_CCR_SIOO
-		s_command.SIOOMode = HAL_XSPI_SIOO_INST_EVERY_CMD;
-	#endif /* XSPI_CCR_SIOO */
-
-	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
-	if (ret != HAL_OK) {
-		LOG_ERR("Failed to set memory mapped mode");
-		return -EIO;
-	}
-
-	/* Initialize the program command */
-	s_command.OperationType = HAL_XSPI_OPTYPE_WRITE_CFG;
-	if (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE) {
-		s_command.Instruction =
-			(dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
-				? ((mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length) ==
-				    HAL_XSPI_ADDRESS_24_BITS)
-					   ? MSPI_STM32_CMD_PP
-					   : MSPI_STM32_CMD_PP_4B)
-				: MSPI_STM32_OCMD_PAGE_PRG;
-	} else {
-		s_command.Instruction = MSPI_STM32_OCMD_PAGE_PRG;
-	}
-
-	s_command.DQSMode = HAL_XSPI_DQS_DISABLE;
-	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
-	if (ret != HAL_OK) {
-		LOG_ERR("Failed to set memory mapped mode");
-		return -EIO;
-	}
-
-	#ifdef XSPI_CR_NOPREF
-		s_MemMappedCfg.NoPrefetchData = HAL_XSPI_AUTOMATIC_PREFETCH_ENABLE;
-	#ifdef XSPI_CR_NOPREF_AXI
-		s_MemMappedCfg.NoPrefetchAXI = HAL_XSPI_AXI_PREFETCH_DISABLE;
-	#endif /* XSPI_CR_NOPREF_AXI */
-	#endif /* XSPI_CR_NOPREF */
-
-	/* Enable the memory-mapping */
-	s_MemMappedCfg.TimeOutActivation = HAL_XSPI_TIMEOUT_COUNTER_DISABLE;
-	ret = HAL_XSPI_MemoryMapped(&dev_data->hmspi, &s_MemMappedCfg);
-	if (ret != HAL_OK) {
-		LOG_ERR("Failed to enable memory mapped mode");
-		return -EIO;
-	}
-
-	return 0;
-}
-
-static inline void mspi_context_release(struct mspi_context *ctx)
-{
-	ctx->owner = NULL;
-	k_sem_give(&ctx->lock);
-}
-
-static inline int mspi_context_lock(struct mspi_context *ctx, const struct mspi_dev_id *req,
-				    const struct mspi_xfer *xfer, mspi_callback_handler_t callback,
-				    struct mspi_callback_context *callback_ctx, bool lockon)
-{
-	int ret = 1;
-
-	if ((k_sem_count_get(&ctx->lock) == 0) && !lockon && (ctx->owner == req)) {
-		return 0;
-	}
-
-	if (k_sem_take(&ctx->lock, K_MSEC(xfer->timeout))) {
-		return -EBUSY;
-	}
-	if (ctx->xfer.async) {
-		if ((xfer->tx_dummy == ctx->xfer.tx_dummy) &&
-		    (xfer->rx_dummy == ctx->xfer.rx_dummy) &&
-		    (xfer->cmd_length == ctx->xfer.cmd_length) &&
-		    (xfer->addr_length == ctx->xfer.addr_length)) {
-			ret = 0;
-		} else if (ctx->packets_left == 0) {
-			if (ctx->callback_ctx) {
-				volatile struct mspi_event_data *evt_data;
-
-				evt_data = &ctx->callback_ctx->mspi_evt.evt_data;
-				while (evt_data->status != 0) {
-				}
-				ret = 1;
-			} else {
-				ret = 0;
-			}
-		} else {
-			return -EIO;
-		}
-	}
-	ctx->owner = req;
-	ctx->xfer = *xfer;
-	ctx->packets_done = 0;
-	ctx->packets_left = ctx->xfer.num_packet;
-	ctx->callback = callback;
-	ctx->callback_ctx = callback_ctx;
-	return ret;
-}
-
 /**
- * Check if the MSPI bus is busy.
- *
- * @param controller MSPI emulation controller device.
- * @return true The MSPI bus is busy.
- * @return false The MSPI bus is idle.
- */
-static inline bool mspi_is_inp(const struct device *controller)
-{
-	struct mspi_stm32_data *dev_data = controller->data;
-
-	return (k_sem_count_get(&dev_data->ctx.lock) == 0);
-}
-
-/**
- * Configure hardware before a transfer.
- *
- * @param controller Pointer to the MSPI controller instance.
- * @param xfer Pointer to the MSPI transfer started by the request entity.
- * @return 0 if successful.
- */
-static int mspi_xfer_config(const struct device *controller, const struct mspi_xfer *xfer)
-{
-	struct mspi_stm32_data *data = controller->data;
-
-	data->dev_cfg.cmd_length = xfer->cmd_length;
-	data->dev_cfg.addr_length = xfer->addr_length;
-	data->dev_cfg.tx_dummy = xfer->tx_dummy;
-	data->dev_cfg.rx_dummy = xfer->rx_dummy;
-
-	return 0;
-}
-
-/*
- * Gives a XSPI_RegularCmdTypeDef with all parameters set
- * except Instruction, Address, NbData
+ * @brief Gives a XSPI_RegularCmdTypeDef with all parameters set except Instruction, Address, NbData
  */
 static XSPI_RegularCmdTypeDef mspi_stm32_prepare_cmd(uint8_t cfg_mode, uint8_t cfg_rate)
 {
@@ -339,54 +89,244 @@ static XSPI_RegularCmdTypeDef mspi_stm32_prepare_cmd(uint8_t cfg_mode, uint8_t c
 	return cmd_tmp;
 }
 
-/* Send a Command to the NOR and Receive/Transceive data if relevant in IT or DMA mode */
+/**
+ * @brief Check if the flash is currently operating in memory-mapped mode.
+ */
+static bool stm32_xspi_is_memorymap(const struct device *dev)
+{
+	struct mspi_stm32_data *dev_data = dev->data;
+
+	return READ_BIT(dev_data->hmspi.Instance->CR, XSPI_CR_FMODE) == XSPI_CR_FMODE;
+}
+
+/**
+ * @brief Sets the device back in indirect mode.
+ */
+static int mspi_stm32_memmap_off(const struct device *controller)
+{
+	struct mspi_stm32_data *dev_data = controller->data;
+
+	if (HAL_XSPI_Abort(&dev_data->hmspi) != HAL_OK) {
+		LOG_ERR("MemMapped abort failed: %x\n",dev_data->hmspi.ErrorCode);
+		return -EIO;
+	}
+	return 0;
+}
+
+/**
+ * @brief Sets the device in Memory-Mapped mode.
+ */
+static int mspi_stm32_memmap_on(const struct device *controller)
+{
+	int ret;
+	struct mspi_stm32_data *dev_data = controller->data;
+	XSPI_MemoryMappedTypeDef s_MemMappedCfg;
+
+	if(stm32_xspi_is_memorymap(controller)) {
+		return 0;
+	}
+
+	/* Configure in MemoryMapped mode */
+	if ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE) &&
+
+	    (mspi_stm32_hal_address_size(dev_data->dev_cfg.addr_length) ==
+	     HAL_XSPI_ADDRESS_24_BITS)) {
+		/* OPI mode and 3-bytes address size not supported by memory */
+		LOG_ERR("MSPI_IO_MODE_SINGLE in 3Bytes addressing is not supported");
+		return -EIO;
+	}
+
+	XSPI_RegularCmdTypeDef s_command =mspi_stm32_prepare_cmd(dev_data->dev_cfg.io_mode, dev_data->dev_cfg.data_rate);
+
+	/* Initialize the read command */
+	s_command.OperationType = HAL_XSPI_OPTYPE_READ_CFG;
+	s_command.InstructionMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					    ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						       ? HAL_XSPI_INSTRUCTION_1_LINE
+						       : HAL_XSPI_INSTRUCTION_8_LINES)
+					    : HAL_XSPI_INSTRUCTION_8_LINES;
+	s_command.InstructionDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					       ? HAL_XSPI_INSTRUCTION_DTR_DISABLE
+					       : HAL_XSPI_INSTRUCTION_DTR_ENABLE;
+	s_command.InstructionWidth = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+							? HAL_XSPI_INSTRUCTION_8_BITS
+							: HAL_XSPI_INSTRUCTION_16_BITS)
+					     : HAL_XSPI_INSTRUCTION_16_BITS;
+	s_command.Instruction = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						   ? ((mspi_stm32_hal_address_size(
+							       dev_data->ctx.xfer.addr_length) ==
+						       HAL_XSPI_ADDRESS_24_BITS)
+							      ? MSPI_STM32_CMD_READ_FAST
+							      : MSPI_STM32_CMD_READ_FAST_4B)
+						   : dev_data->dev_cfg.read_cmd)
+					: MSPI_STM32_OCMD_DTR_RD;
+	s_command.AddressMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						   ? HAL_XSPI_ADDRESS_1_LINE
+						   : HAL_XSPI_ADDRESS_8_LINES)
+					: HAL_XSPI_ADDRESS_8_LINES;
+	s_command.AddressDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					   ? HAL_XSPI_ADDRESS_DTR_DISABLE
+					   : HAL_XSPI_ADDRESS_DTR_ENABLE;
+	s_command.AddressWidth =
+		(dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+			? mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length)
+			: HAL_XSPI_ADDRESS_32_BITS;
+	s_command.DataMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+				     ? ((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+						? HAL_XSPI_DATA_1_LINE
+						: HAL_XSPI_DATA_8_LINES)
+				     : HAL_XSPI_DATA_8_LINES;
+	s_command.DataDTRMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+					? HAL_XSPI_DATA_DTR_DISABLE
+					: HAL_XSPI_DATA_DTR_ENABLE;
+	s_command.DummyCycles = dev_data->ctx.xfer.rx_dummy;
+	s_command.DQSMode = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE)
+				    ? HAL_XSPI_DQS_DISABLE
+				    : HAL_XSPI_DQS_ENABLE;
+
+	#ifdef XSPI_CCR_SIOO
+		s_command.SIOOMode = HAL_XSPI_SIOO_INST_EVERY_CMD;
+	#endif /* XSPI_CCR_SIOO */
+
+	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	if (ret != HAL_OK) {
+		LOG_ERR("Failed to set memory mapped mode");
+		return -EIO;
+	}
+
+	/* Initialize the program command */
+	s_command.OperationType = HAL_XSPI_OPTYPE_WRITE_CFG;
+	if (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_SINGLE) {
+		s_command.Instruction =
+			(dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE)
+				? ((mspi_stm32_hal_address_size(dev_data->ctx.xfer.addr_length) ==
+				    HAL_XSPI_ADDRESS_24_BITS)
+					   ? MSPI_STM32_CMD_PP
+					   : MSPI_STM32_CMD_PP_4B)
+				: MSPI_STM32_OCMD_PAGE_PRG;
+	} else {
+		s_command.Instruction = MSPI_STM32_OCMD_PAGE_PRG;
+	}
+
+	s_command.DQSMode = HAL_XSPI_DQS_DISABLE;
+	ret = HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
+	if (ret != HAL_OK) {
+		LOG_ERR("Failed to set memory mapped mode");
+		return -EIO;
+	}
+
+	#ifdef XSPI_CR_NOPREF
+		s_MemMappedCfg.NoPrefetchData = HAL_XSPI_AUTOMATIC_PREFETCH_ENABLE;
+	#ifdef XSPI_CR_NOPREF_AXI
+		s_MemMappedCfg.NoPrefetchAXI = HAL_XSPI_AXI_PREFETCH_DISABLE;
+	#endif /* XSPI_CR_NOPREF_AXI */
+	#endif /* XSPI_CR_NOPREF */
+
+	/* Enable the memory-mapping */
+	s_MemMappedCfg.TimeOutActivation = HAL_XSPI_TIMEOUT_COUNTER_DISABLE;
+	ret = HAL_XSPI_MemoryMapped(&dev_data->hmspi, &s_MemMappedCfg);
+	if (ret != HAL_OK) {
+		LOG_ERR("Failed to enable memory mapped mode");
+		return -EIO;
+	}
+
+	return 0;
+}
+
+static inline int mspi_context_lock(struct mspi_context *ctx, const struct mspi_dev_id *req,
+				    const struct mspi_xfer *xfer, bool lockon)
+{
+	int ret = 0;
+	if (k_sem_take(&ctx->lock, K_MSEC(xfer->timeout))) {
+		return -EBUSY;
+	}
+
+	ctx->xfer = *xfer;
+	ctx->packets_done = 0;
+	ctx->packets_left = ctx->xfer.num_packet;
+	return ret;
+}
+
+/**
+ * Check if the MSPI bus is busy.
+ *
+ * @param controller MSPI emulation controller device.
+ * @return true The MSPI bus is busy.
+ * @return false The MSPI bus is idle.
+ */
+static inline bool mspi_is_inp(const struct device *controller)
+{
+	struct mspi_stm32_data *dev_data = controller->data;
+
+	return (k_sem_count_get(&dev_data->ctx.lock) == 0);
+}
+
+/**
+ * @brief Send a Command to the NOR and Receive/Transceive data if relevant in IT or DMA mode.
+ *
+ */
 static int mspi_stm32_access(const struct device *dev, const struct mspi_xfer_packet *packet,
 			     uint8_t access_mode)
 {
 	struct mspi_stm32_data *dev_data = dev->data;
 	HAL_StatusTypeDef hal_ret;
 
-	#ifdef CONFIG_STM32_MEMMAP
-	ARG_UNUSED(access_mode);
-		if(packet->dir == MSPI_RX) {
-			if (packet->data_buf == NULL) {
-				LOG_ERR("MSPI READ failed: destination buffer is NULL");
-				goto e_access;
-			}
+	if(dev_data->xip_cfg.enable) {
+		ARG_UNUSED(access_mode);
 
-			if (!stm32_xspi_is_memorymap(dev)) {
+		if((packet->cmd == MSPI_STM32_CMD_WREN) || (packet->cmd == MSPI_STM32_OCMD_WREN) ||
+		   (packet->cmd == MSPI_STM32_CMD_SE_4B) ||  (packet->cmd == MSPI_STM32_CMD_SE) ||
+		   (packet->cmd == MSPI_STM32_OCMD_SE) ||
+		   ((mspi_stm32_hal_address_size(dev_data->dev_cfg.addr_length) == HAL_XSPI_ADDRESS_24_BITS) && (dev_data->dev_cfg.io_mode == MSPI_IO_MODE_SINGLE))){
+			LOG_DBG(" MSPI_IO_MODE_SINGLE in 3Bytes addressing is not supported in memory map mode, switching to indirect mode");
+			if (stm32_xspi_is_memorymap(dev)) {
+				hal_ret = mspi_stm32_memmap_off(dev);
+				if (hal_ret != 0) {
+					LOG_ERR("Failed to abort memory-mapped access");
+					goto e_access;
+				}
+			}
+			goto indirect;
+		}
+
+		if(packet->data_buf == NULL) {
+			LOG_ERR("data buf is null :%x\n", packet->cmd);
+			return -EIO;
+		}
+
+		if (!stm32_xspi_is_memorymap(dev)) {
 				hal_ret = mspi_stm32_memmap_on(dev);
 				if (hal_ret != 0) {
 					LOG_ERR("Failed to set memory mapped");
 					goto e_access;
 				}
-			}
+		}
 
-			__ASSERT_NO_MSG(stm32_xspi_is_memorymap(dev));
+		__ASSERT_NO_MSG(stm32_xspi_is_memorymap(dev));
+			uintptr_t mmap_addr = dev_data->memmap_base_addr + packet->address;
 
-			uintptr_t mmap_addr = STM32_XSPI_BASE_ADDRESS + packet->address;
-			LOG_INF("Memory-mapped read from 0x%08lx, len %zu\n", mmap_addr, packet->num_bytes);
+		if(packet->dir == MSPI_RX) {
+			LOG_INF("Memory-mapped read from 0x%08lx, len %zu and cmd:%x\n", mmap_addr, packet->num_bytes, packet->cmd);
 			memcpy(packet->data_buf, (void *)mmap_addr, packet->num_bytes);
-
+			HAL_Delay(1);
 			printf("/////data after:\n");
 			for (size_t i = 0; i < packet->num_bytes; i++) {
-				printk("%02X ", packet->data_buf[i]); // print each byte in hex
+				printk("%02X ", packet->data_buf[i]);
 			}
 			printk("\n");
 			goto e_access;
 		} else {
-			ARG_UNUSED(packet);
-			if (stm32_xspi_is_memorymap(dev)) {
-				/* Abort ongoing transfer to force CS high/BUSY deasserted */
-				hal_ret = mspi_stm32_memmap_off(dev);
-				if (hal_ret != 0) {
-					LOG_ERR("Failed to abort memory-mapped access before write");
-					goto e_access;
-				}
-			}
+			LOG_INF("Memory-mapped write from 0x%08lx, len %zu\n", mmap_addr, packet->num_bytes);
+			memcpy((void *)mmap_addr,packet->data_buf, packet->num_bytes);
+			HAL_Delay(1);
+			goto e_access;
 		}
-	#endif
+	}
 
+indirect:
 	XSPI_RegularCmdTypeDef cmd =
 		mspi_stm32_prepare_cmd(dev_data->dev_cfg.io_mode, dev_data->dev_cfg.data_rate);
 
@@ -410,14 +350,6 @@ static int mspi_stm32_access(const struct device *dev, const struct mspi_xfer_pa
 
 	LOG_DBG("MSPI access Instruction 0x%x", cmd.Instruction);
 
-	dev_data->cmd_status = 0;
-
-	if((dev_data->dev_cfg.io_mode == MSPI_IO_MODE_OCTAL) && (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_DUAL)) {
-		if((packet->dir ==MSPI_RX) && (packet->cmd == SPI_NOR_OCMD_RD)) {
-			cmd.Instruction = SPI_NOR_OCMD_DTR_RD;
-		}
-	}
-
 	hal_ret = HAL_XSPI_Command(&dev_data->hmspi, &cmd, HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
 	if (hal_ret != HAL_OK) {
 		LOG_ERR("%d: Failed to send XSPI instruction", hal_ret);
@@ -425,7 +357,6 @@ static int mspi_stm32_access(const struct device *dev, const struct mspi_xfer_pa
 	}
 
 	if (packet->num_bytes == 0) {
-		/* no data to receive : done */
 		return 0;
 	}
 
@@ -485,8 +416,6 @@ static int mspi_stm32_wait_auto_polling(const struct device *dev, uint8_t match_
 	struct mspi_stm32_data *dev_data = dev->data;
 	XSPI_AutoPollingTypeDef s_config;
 
-	dev_data->cmd_status = 0;
-
 	/* Set the match to check if the bit is Reset */
 	s_config.MatchValue = match_value;
 	s_config.MatchMask = match_mask;
@@ -507,9 +436,6 @@ static int mspi_stm32_wait_auto_polling(const struct device *dev, uint8_t match_
 		return -EIO;
 	}
 
-	/* HAL_XSPI_AutoPolling_IT enables transfer error interrupt which sets
-	 * cmd_status.
-	 */
 	return 0;
 }
 
@@ -517,16 +443,12 @@ static int mspi_stm32_wait_auto_polling(const struct device *dev, uint8_t match_
  * Function to Read the status reg of the device
  * Send the RDSR command (according to io_mode/data_rate
  * Then set the Autopolling mode with match mask/value bit
- * --> Blocking
  */
-static int mspi_stm32_status_reg(const struct device *controller, const struct mspi_xfer *xfer,
-				 mspi_callback_handler_t cb, struct mspi_callback_context *cb_ctx)
+static int mspi_stm32_status_reg(const struct device *controller, const struct mspi_xfer *xfer)
 {
+	int ret = 0;
 	struct mspi_stm32_data *dev_data = controller->data;
 	struct mspi_context *ctx = &dev_data->ctx;
-
-	int ret = 0;
-	int cfg_flag = 0;
 
 	if (xfer->num_packet == 0 || !xfer->packets) {
 		LOG_ERR("Status Reg.: wrong parameters");
@@ -534,40 +456,49 @@ static int mspi_stm32_status_reg(const struct device *controller, const struct m
 	}
 
 	/* Lock with the expected timeout value = ctx->xfer.timeout */
-	cfg_flag = mspi_context_lock(ctx, dev_data->dev_id, xfer, cb, cb_ctx, true);
+	ret = mspi_context_lock(ctx, dev_data->dev_id, xfer, true);
 	/** For async, user must make sure when cfg_flag = 0 the dummy and instr addr length
 	 * in mspi_xfer of the two calls are the same if the first one has not finished yet.
 	 */
-	if (cfg_flag) {
-		if (cfg_flag != 1) {
-			ret = cfg_flag;
-			goto status_err;
-		}
+	if (ret) {
+		goto status_err;
 	}
 
 	XSPI_RegularCmdTypeDef cmd =
 		mspi_stm32_prepare_cmd(dev_data->dev_cfg.io_mode, dev_data->dev_cfg.data_rate);
-	/* with this command for tstaus Reg, only one packet containing 2 bytes match/mask */
-	cmd.DataLength = ctx->xfer.num_packet;
-	cmd.Instruction = ctx->xfer.packets->cmd;
-	cmd.AddressMode = HAL_XSPI_ADDRESS_1_LINE;
-	cmd.DataMode = HAL_XSPI_DATA_1_LINE; /* 1-line DataMode for any non-OSPI transfer */
-	/* DummyCycle to give to the mspi_stm32_read_access/mspi_stm32_write_access */
-	cmd.DummyCycles = 0;
-	cmd.InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
-	cmd.Address = ctx->xfer.packets->address;
-
+	if(dev_data->dev_cfg.io_mode == MSPI_IO_MODE_OCTAL){
+		cmd.Instruction = MSPI_STM32_OCMD_RDSR ;
+		cmd.DummyCycles = (dev_data->dev_cfg.data_rate == MSPI_DATA_RATE_DUAL)?
+		MSPI_STM32_DUMMY_REG_OCTAL_DTR :MSPI_STM32_DUMMY_REG_OCTAL;
+	}else{
+		cmd.Instruction = MSPI_STM32_CMD_RDSR;
+		cmd.AddressMode = HAL_XSPI_ADDRESS_NONE;
+		cmd.DataMode = HAL_XSPI_DATA_1_LINE; /* 1-line DataMode for any non-OSPI transfer */
+		/* DummyCycle to give to the mspi_stm32_read_access/mspi_stm32_write_access */
+		cmd.DummyCycles = 0;
+		cmd.InstructionMode = HAL_XSPI_INSTRUCTION_1_LINE;
+	}
+	cmd.Address = 0U;
 	LOG_DBG("MSPI poll status reg.");
 
 	XSPI_AutoPollingTypeDef s_config;
 
 	/* Set the match to check if the bit is Reset */
-	s_config.MatchValue = ctx->xfer.packets->data_buf[0];
-	s_config.MatchMask = ctx->xfer.packets->data_buf[1];
+	s_config.MatchValue = MSPI_STM32_WEL_MATCH;
+	s_config.MatchMask = MSPI_STM32_WEL_MASK;
 
 	s_config.MatchMode = HAL_XSPI_MATCH_MODE_AND;
 	s_config.IntervalTime = MSPI_STM32_AUTO_POLLING_INTERVAL;
 	s_config.AutomaticStop = HAL_XSPI_AUTOMATIC_STOP_ENABLE;
+
+	if (stm32_xspi_is_memorymap(controller)) {
+		/* Abort ongoing transfer to force CS high/BUSY deasserted */
+		int hal_ret = mspi_stm32_memmap_off(controller);
+		if (hal_ret != 0) {
+			LOG_ERR("Failed to abort memory-mapped access before write");
+		return  -1;
+		}
+	}
 
 	if (HAL_XSPI_Command(&dev_data->hmspi, &cmd, HAL_XSPI_TIMEOUT_DEFAULT_VALUE)) {
 		LOG_ERR("%d: Failed to send XSPI instruction", ret);
@@ -581,7 +512,7 @@ static int mspi_stm32_status_reg(const struct device *controller, const struct m
 		HAL_XSPI_TIMEOUT_DEFAULT_VALUE);
 
 status_err:
-	mspi_context_release(ctx);
+	k_sem_give(&ctx->lock);
 	return ret;
 }
 
@@ -703,6 +634,15 @@ static int mspi_stm32_write_cfg2reg_dummy(const struct device *dev, uint8_t cfg_
 				       ? 1U
 				       : ((cfg_rate == MSPI_DATA_RATE_DUAL) ? 2U : 1U);
 
+	if (stm32_xspi_is_memorymap(dev)) {
+		/* Abort ongoing transfer to force CS high/BUSY deasserted */
+		int hal_ret = mspi_stm32_memmap_off(dev);
+		if (hal_ret != 0) {
+			LOG_ERR("Failed to abort memory-mapped access before write");
+		return  -1;
+		}
+	}
+
 	if (HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) !=
 	    HAL_OK) {
 		LOG_ERR("MSPI transmit cmd");
@@ -722,6 +662,7 @@ static int mspi_stm32_write_cfg2reg_dummy(const struct device *dev, uint8_t cfg_
 static int mspi_stm32_write_cfg2reg_io(const struct device *dev, uint8_t cfg_mode, uint8_t cfg_rate,
 				       uint8_t op_enable)
 {
+	int ret = 0;
 	struct mspi_stm32_data *dev_data = dev->data;
 	XSPI_RegularCmdTypeDef s_command = mspi_stm32_prepare_cmd(cfg_mode, cfg_rate);
 
@@ -734,6 +675,14 @@ static int mspi_stm32_write_cfg2reg_io(const struct device *dev, uint8_t cfg_mod
 	s_command.DataLength = (cfg_mode == MSPI_IO_MODE_SINGLE)
 				       ? 1U
 				       : ((cfg_rate == MSPI_DATA_RATE_DUAL) ? 2U : 1U);
+	if (stm32_xspi_is_memorymap(dev)) {
+		/* Abort ongoing transfer to force CS high/BUSY deasserted */
+		ret = mspi_stm32_memmap_off(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to abort memory-mapped access before write");
+			return  ret;
+		}
+	}
 
 	if (HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) !=
 	    HAL_OK) {
@@ -747,13 +696,14 @@ static int mspi_stm32_write_cfg2reg_io(const struct device *dev, uint8_t cfg_mod
 		return -EIO;
 	}
 
-	return 0;
+	return ret;
 }
 
 /* Read Flash configuration register 2 with new single or octal SPI protocol */
 static int mspi_stm32_read_cfg2reg(const struct device *dev, uint8_t cfg_mode, uint8_t cfg_rate,
 				   uint8_t *value)
 {
+	int ret = 0;
 	struct mspi_stm32_data *dev_data = dev->data;
 	XSPI_RegularCmdTypeDef s_command = mspi_stm32_prepare_cmd(cfg_mode, cfg_rate);
 
@@ -768,7 +718,14 @@ static int mspi_stm32_read_cfg2reg(const struct device *dev, uint8_t cfg_mode, u
 				? MSPI_STM32_DUMMY_REG_OCTAL_DTR
 			    : MSPI_STM32_DUMMY_REG_OCTAL);
 	s_command.DataLength = (cfg_rate == MSPI_DATA_RATE_DUAL) ? 2U : 1U;
-
+	if (stm32_xspi_is_memorymap(dev)) {
+		/* Abort ongoing transfer to force CS high/BUSY deasserted */
+		ret = mspi_stm32_memmap_off(dev);
+		if (ret != 0) {
+			LOG_ERR("Failed to abort memory-mapped access before write");
+			return  ret;
+		}
+	}
 	if (HAL_XSPI_Command(&dev_data->hmspi, &s_command, HAL_XSPI_TIMEOUT_DEFAULT_VALUE) !=
 	    HAL_OK) {
 		LOG_ERR("Write Flash configuration reg2 failed");
@@ -780,7 +737,7 @@ static int mspi_stm32_read_cfg2reg(const struct device *dev, uint8_t cfg_mode, u
 		return -EIO;
 	}
 
-	return 0;
+	return ret;
 }
 
 /* function to Send the command to configure the device according to the DTS */
@@ -836,13 +793,14 @@ static int mspi_stm32_config_mem(const struct device *dev, uint8_t cfg_mode, uin
 		LOG_ERR("XSPI flash busy failed");
 		return -EIO;
 	}
+
 	if (mspi_stm32_read_cfg2reg(dev, MSPI_IO_MODE_OCTAL, cfg_rate, reg) != 0) {
 		/* Check the configuration has been correctly done on HAL_XSPI_REG2_ADDR1 */
 		LOG_ERR("MSPI flash config read failed");
 		return -EIO;
 	}
 
-	LOG_INF("XSPI flash config is OCTO / %s", ((cfg_rate == MSPI_DATA_RATE_SINGLE) ?
+	LOG_DBG("XSPI flash config is OCTO / %s", ((cfg_rate == MSPI_DATA_RATE_SINGLE) ?
 		(char *)"STR" :
 		(char *)"DTR"));
 
@@ -876,14 +834,10 @@ __weak HAL_StatusTypeDef HAL_DMA_Abort(DMA_HandleTypeDef *hdma)
 void HAL_XSPI_ErrorCallback(XSPI_HandleTypeDef *hmspi)
 {
 	struct mspi_stm32_data *dev_data = CONTAINER_OF(hmspi, struct mspi_stm32_data, hmspi);
-	struct mspi_context *ctx = &dev_data->ctx;
 
 	LOG_DBG("Error cb");
 
-	dev_data->cmd_status = -EIO;
-
 	k_sem_give(&dev_data->sync);
-	mspi_context_release(ctx);
 }
 
 /*
@@ -892,12 +846,10 @@ void HAL_XSPI_ErrorCallback(XSPI_HandleTypeDef *hmspi)
 void HAL_XSPI_CmdCpltCallback(XSPI_HandleTypeDef *hmspi)
 {
 	struct mspi_stm32_data *dev_data = CONTAINER_OF(hmspi, struct mspi_stm32_data, hmspi);
-	struct mspi_context *ctx = &dev_data->ctx;
 
 	LOG_DBG("Cmd Cplt cb");
 
 	k_sem_give(&dev_data->sync);
-	mspi_context_release(ctx);
 }
 
 /*
@@ -906,12 +858,10 @@ void HAL_XSPI_CmdCpltCallback(XSPI_HandleTypeDef *hmspi)
 void HAL_XSPI_RxCpltCallback(XSPI_HandleTypeDef *hmspi)
 {
 	struct mspi_stm32_data *dev_data = CONTAINER_OF(hmspi, struct mspi_stm32_data, hmspi);
-	struct mspi_context *ctx = &dev_data->ctx;
 
 	LOG_DBG("Rx Cplt cb");
 
 	k_sem_give(&dev_data->sync);
-	mspi_context_release(ctx);
 }
 
 /*
@@ -920,14 +870,12 @@ void HAL_XSPI_RxCpltCallback(XSPI_HandleTypeDef *hmspi)
 void HAL_XSPI_TxCpltCallback(XSPI_HandleTypeDef *hmspi)
 {
 	struct mspi_stm32_data *dev_data = CONTAINER_OF(hmspi, struct mspi_stm32_data, hmspi);
-	struct mspi_context *ctx = &dev_data->ctx;
 
 	LOG_DBG("Tx Cplt cb");
 
 	dev_data->ctx.packets_done++;
 
 	k_sem_give(&dev_data->sync);
-	mspi_context_release(ctx);
 }
 
 /*
@@ -936,12 +884,10 @@ void HAL_XSPI_TxCpltCallback(XSPI_HandleTypeDef *hmspi)
 void HAL_XSPI_StatusMatchCallback(XSPI_HandleTypeDef *hmspi)
 {
 	struct mspi_stm32_data *dev_data = CONTAINER_OF(hmspi, struct mspi_stm32_data, hmspi);
-	struct mspi_context *ctx = &dev_data->ctx;
 
 	LOG_DBG("Status Match cb");
 
 	k_sem_give(&dev_data->sync);
-	mspi_context_release(ctx);
 }
 
 /*
@@ -950,14 +896,48 @@ void HAL_XSPI_StatusMatchCallback(XSPI_HandleTypeDef *hmspi)
 void HAL_XSPI_TimeOutCallback(XSPI_HandleTypeDef *hmspi)
 {
 	struct mspi_stm32_data *dev_data = CONTAINER_OF(hmspi, struct mspi_stm32_data, hmspi);
-	struct mspi_context *ctx = &dev_data->ctx;
 
 	LOG_DBG("Timeout cb");
 
-	dev_data->cmd_status = -EIO;
-
 	k_sem_give(&dev_data->sync);
-	mspi_context_release(ctx);
+}
+
+/**
+ * Verify if the device with dev_id is on this MSPI bus.
+ *
+ * @param controller Pointer to the device structure for the driver instance.
+ * @param dev_id Pointer to the device ID structure from a device.
+ * @return 0 The device is on this MSPI bus.
+ * @return -ENODEV The device is not on this MSPI bus.
+ */
+static inline int mspi_verify_device(const struct device *controller,
+				     const struct mspi_dev_id *dev_id)
+{
+	const struct mspi_stm32_conf *cfg = controller->config;
+	int device_index = cfg->mspicfg.num_periph;
+	int ret = 0;
+
+	if (cfg->mspicfg.num_ce_gpios != 0) {
+		for (int i = 0; i < cfg->mspicfg.num_periph; i++) {
+			if (dev_id->ce.port == cfg->mspicfg.ce_group[i].port &&
+			    dev_id->ce.pin == cfg->mspicfg.ce_group[i].pin &&
+			    dev_id->ce.dt_flags == cfg->mspicfg.ce_group[i].dt_flags) {
+				device_index = i;
+			}
+		}
+
+		if (device_index >= cfg->mspicfg.num_periph || device_index != dev_id->dev_idx) {
+			LOG_ERR("%u, invalid device ID.", __LINE__);
+			return -ENODEV;
+		}
+	} else {
+		if (dev_id->dev_idx >= cfg->mspicfg.num_periph) {
+			LOG_ERR("%u, invalid device ID.", __LINE__);
+			return -ENODEV;
+		}
+	}
+
+	return ret;
 }
 
 /**
@@ -969,7 +949,7 @@ void HAL_XSPI_TimeOutCallback(XSPI_HandleTypeDef *hmspi)
  * @return 0 MSPI device configuration successful.
  * @return -Error MSPI device configuration fail.
  */
-static inline int mspi_dev_cfg_check_save(const struct device *controller,
+static int mspi_dev_cfg_save(const struct device *controller,
 					  const enum mspi_dev_cfg_mask param_mask,
 					  const struct mspi_dev_cfg *dev_cfg)
 {
@@ -1072,44 +1052,6 @@ static inline int mspi_dev_cfg_check_save(const struct device *controller,
 }
 
 /**
- * Verify if the device with dev_id is on this MSPI bus.
- *
- * @param controller Pointer to the device structure for the driver instance.
- * @param dev_id Pointer to the device ID structure from a device.
- * @return 0 The device is on this MSPI bus.
- * @return -ENODEV The device is not on this MSPI bus.
- */
-static inline int mspi_verify_device(const struct device *controller,
-				     const struct mspi_dev_id *dev_id)
-{
-	const struct mspi_stm32_conf *cfg = controller->config;
-	int device_index = cfg->mspicfg.num_periph;
-	int ret = 0;
-
-	if (cfg->mspicfg.num_ce_gpios != 0) {
-		for (int i = 0; i < cfg->mspicfg.num_periph; i++) {
-			if (dev_id->ce.port == cfg->mspicfg.ce_group[i].port &&
-			    dev_id->ce.pin == cfg->mspicfg.ce_group[i].pin &&
-			    dev_id->ce.dt_flags == cfg->mspicfg.ce_group[i].dt_flags) {
-				device_index = i;
-			}
-		}
-
-		if (device_index >= cfg->mspicfg.num_periph || device_index != dev_id->dev_idx) {
-			LOG_ERR("%u, invalid device ID.", __LINE__);
-			return -ENODEV;
-		}
-	} else {
-		if (dev_id->dev_idx >= cfg->mspicfg.num_periph) {
-			LOG_ERR("%u, invalid device ID.", __LINE__);
-			return -ENODEV;
-		}
-	}
-
-	return ret;
-}
-
-/**
  * API implementation of mspi_dev_config : controller device specific configuration
  *
  * @param controller Pointer to the device structure for the driver instance.
@@ -1152,14 +1094,6 @@ static int mspi_stm32_dev_config(const struct device *controller, const struct m
 		return ret;
 	}
 
-	// if (param_mask & MSPI_DEVICE_CONFIG_DATA_RATE) {
-	// 	/* TODO: add support for DTR */
-	// 	if (dev_cfg->data_rate != MSPI_DATA_RATE_SINGLE) {
-	// 		LOG_ERR("Only single data rate is supported.");
-	// 		return -ENOTSUP;
-	// 	}
-	// }
-
 	/* Proceed step by step in configuration */
 	if (param_mask & (MSPI_DEVICE_CONFIG_IO_MODE | MSPI_DEVICE_CONFIG_DATA_RATE)) {
 		/* Going to set the XSPI mode and transfer rate */
@@ -1176,8 +1110,10 @@ static int mspi_stm32_dev_config(const struct device *controller, const struct m
 	 */
 	data->dev_id = (struct mspi_dev_id *)dev_id;
 	/* Go on with other parameters if supported */
-	data->dev_cfg = *dev_cfg;
-
+	if(mspi_dev_cfg_save(controller, param_mask, dev_cfg)){
+		LOG_ERR("failed to change device cfg");
+		return -1;
+	}
 e_return:
 	k_mutex_unlock(&data->lock);
 
@@ -1220,43 +1156,6 @@ static int mspi_stm32_xip_config(const struct device *controller, const struct m
 }
 
 /**
- * API implementation of mspi_timing_config.
- *
- * @param controller Pointer to the device structure for the driver instance.
- * @param dev_id Pointer to the device ID structure from a device.
- * @param param_mask The macro definition of what should be configured in cfg.
- * @param timing_cfg The controller timing configuration for MSPI.
- *
- * @retval 0 if successful.
- * @retval -ESTALE device ID don't match, need to call mspi_dev_config first.
- * @retval -ENOTSUP param_mask value is not supported.
- */
-static int mspi_stm32_timing_config(const struct device *controller,
-				    const struct mspi_dev_id *dev_id, const uint32_t param_mask,
-				    void *timing_cfg)
-{
-	struct mspi_stm32_data *dev_data = controller->data;
-
-	if (mspi_is_inp(controller)) {
-		return -EBUSY;
-	}
-
-	if (dev_id != dev_data->dev_id) {
-		LOG_ERR("timing config : dev_id don't match");
-		return -ESTALE;
-	}
-
-	if (param_mask == MSPI_TIMING_PARAM_DUMMY) {
-		dev_data->timing_cfg = *(struct mspi_timing_cfg *)timing_cfg;
-	} else {
-		LOG_ERR("param_mask  %dnot supported.", param_mask);
-		return -ENOTSUP;
-	}
-
-	return 0;
-}
-
-/**
  * API implementation of mspi_get_channel_status.
  *
  * @param controller Pointer to the device structure for the driver instance.
@@ -1272,101 +1171,23 @@ static int mspi_stm32_get_channel_status(const struct device *controller, uint8_
 
 	ARG_UNUSED(ch);
 
-	if (HAL_XSPI_GET_FLAG(&dev_data->hmspi, HAL_XSPI_FLAG_BUSY) == SET) {
+	if (mspi_is_inp(controller) || (HAL_XSPI_GET_FLAG(&dev_data->hmspi, HAL_XSPI_FLAG_BUSY) == SET)) {
 		ret = -EBUSY;
-	}
-
-	if (mspi_is_inp(controller)) {
-		return -EBUSY;
 	}
 
 	dev_data->dev_id = NULL;
 
-	k_mutex_unlock(&dev_data->lock);
-
 	return ret;
 }
 
-/**
- * API implementation of mspi_register_callback.
- *
- * @param controller Pointer to the device structure for the driver instance.
- * @param dev_id Pointer to the device ID structure from a device.
- * @param evt_type The event type associated the callback.
- * @param cb Pointer to the user implemented callback function.
- * @param ctx Pointer to the callback context.
- *
- * @retval 0 if successful.
- * @retval -ESTALE device ID don't match, need to call mspi_dev_config first.
- * @retval -ENOTSUP evt_type not supported.
- */
-static int mspi_stm32_register_callback(const struct device *controller,
-					const struct mspi_dev_id *dev_id,
-					const enum mspi_bus_event evt_type,
-					mspi_callback_handler_t cb,
-					struct mspi_callback_context *ctx)
+
+static int mspi_stm32_pio_transceive(const struct device *controller, const struct mspi_xfer *xfer)
 {
-	struct mspi_stm32_data *data = controller->data;
-
-	if (mspi_is_inp(controller)) {
-		return -EBUSY;
-	}
-
-	if (dev_id != data->dev_id) {
-		LOG_ERR("reg cb : dev_id don't match");
-		return -ESTALE;
-	}
-
-	if (evt_type >= MSPI_BUS_EVENT_MAX) {
-		LOG_ERR("callback types %d not supported.", evt_type);
-		return -ENOTSUP;
-	}
-
-	data->cbs[evt_type] = cb;
-	data->cb_ctxs[evt_type] = ctx;
-	return 0;
-}
-
-/**
- * API implementation of mspi_scramble_config.
- *
- * @param controller Pointer to the device structure for the driver instance.
- * @param dev_id Pointer to the device ID structure from a device.
- * @param scramble_cfg The controller scramble configuration for MSPI.
- *
- * @retval 0 if successful.
- * @retval -ESTALE device ID don't match, need to call mspi_dev_config first.
- */
-static int mspi_stm32_scramble_config(const struct device *controller,
-				      const struct mspi_dev_id *dev_id,
-				      const struct mspi_scramble_cfg *scramble_cfg)
-{
-
-	struct mspi_stm32_data *data = controller->data;
 	int ret = 0;
-
-	if (mspi_is_inp(controller)) {
-		return -EBUSY;
-	}
-	if (dev_id != data->dev_id) {
-		LOG_ERR("scramble config: dev_id don't match");
-		return -ESTALE;
-	}
-
-	data->scramble_cfg = *scramble_cfg;
-	return ret;
-}
-
-static int mspi_stm32_pio_transceive(const struct device *controller, const struct mspi_xfer *xfer,
-				     mspi_callback_handler_t cb,
-				     struct mspi_callback_context *cb_ctx)
-{
+	uint32_t packet_idx;
 	struct mspi_stm32_data *dev_data = controller->data;
 	struct mspi_context *ctx = &dev_data->ctx;
 	const struct mspi_xfer_packet *packet;
-	uint32_t packet_idx;
-	int ret = 0;
-	int cfg_flag = 0;
 
 	if (xfer->num_packet == 0 || !xfer->packets ||
 	    xfer->timeout > CONFIG_MSPI_COMPLETION_TIMEOUT_TOLERANCE) {
@@ -1375,147 +1196,32 @@ static int mspi_stm32_pio_transceive(const struct device *controller, const stru
 	}
 
 	/* DummyCycle to give to the mspi_stm32_read_access/mspi_stm32_write_access */
-	cfg_flag = mspi_context_lock(ctx, dev_data->dev_id, xfer, cb, cb_ctx, true);
+	ret = mspi_context_lock(ctx, dev_data->dev_id, xfer, true);
 	/** For async, user must make sure when cfg_flag = 0 the dummy and instr addr length
 	 * in mspi_xfer of the two calls are the same if the first one has not finished yet.
 	 */
-	if (cfg_flag) {
-		if (cfg_flag != 1) {
-			ret = cfg_flag;
-			goto pio_err;
-		}
+	if (ret) {
+		goto pio_end;
 	}
 
-	/* PIO mode : Synchronous transfer is for command mode with Timeout */
-	if (!ctx->xfer.async) {
-		/* Synchronous transfer */
-		while (ctx->packets_left > 0) {
-			packet_idx = ctx->xfer.num_packet - ctx->packets_left;
-			packet = &ctx->xfer.packets[packet_idx];
-			/*
-			 * Always starts with a command,
-			 * then payload is given by the xfer->num_packet
-			 */
-			ret = mspi_stm32_access(controller, packet, MSPI_ACCESS_SYNC);
-
-			ctx->packets_left--;
-			if (ret) {
-				ret = -EIO;
-				goto pio_err;
-			}
-		}
-
-	} else {
-		/* Asynchronous transfer call read/write with IT and callback function */
-		while (ctx->packets_left > 0) {
-			packet_idx = ctx->xfer.num_packet - ctx->packets_left;
-			packet = &ctx->xfer.packets[packet_idx];
-
-			if (ctx->callback && packet->cb_mask == MSPI_BUS_XFER_COMPLETE_CB) {
-				ctx->callback_ctx->mspi_evt.evt_type = MSPI_BUS_XFER_COMPLETE;
-				ctx->callback_ctx->mspi_evt.evt_data.controller = controller;
-				ctx->callback_ctx->mspi_evt.evt_data.dev_id = dev_data->ctx.owner;
-				ctx->callback_ctx->mspi_evt.evt_data.packet = packet;
-				ctx->callback_ctx->mspi_evt.evt_data.packet_idx = packet_idx;
-				ctx->callback_ctx->mspi_evt.evt_data.status = ~0;
-			}
-
-			mspi_callback_handler_t callback = NULL;
-
-			if (packet->cb_mask == MSPI_BUS_XFER_COMPLETE_CB) {
-				callback = (mspi_callback_handler_t)ctx->callback;
-			}
-
-			ret = mspi_stm32_access(controller, packet, MSPI_ACCESS_ASYNC);
-
-			ctx->packets_left--;
-			if (ret) {
-				goto pio_err;
-			}
-		}
-	}
-
-pio_err:
-	mspi_context_release(ctx);
-	return ret;
-}
-
-static int mspi_stm32_dma_transceive(const struct device *controller, const struct mspi_xfer *xfer,
-				     mspi_callback_handler_t cb,
-				     struct mspi_callback_context *cb_ctx)
-{
-	struct mspi_stm32_data *dev_data = controller->data;
-	struct mspi_context *ctx = &dev_data->ctx;
-	int ret = 0;
-	int cfg_flag = 0;
-
-	if (xfer->num_packet == 0 || !xfer->packets ||
-	    xfer->timeout > CONFIG_MSPI_COMPLETION_TIMEOUT_TOLERANCE) {
-		return -EFAULT;
-	}
-
-	cfg_flag = mspi_context_lock(ctx, dev_data->dev_id, xfer, cb, cb_ctx, true);
-	/** For async, user must make sure when cfg_flag = 0 the dummy and instr addr length
-	 * in mspi_xfer of the two calls are the same if the first one has not finished yet.
-	 */
-	if (cfg_flag) {
-		if (cfg_flag == 1) {
-			ret = mspi_xfer_config(controller, xfer);
-			if (ret) {
-				goto dma_err;
-			}
-		} else {
-			ret = cfg_flag;
-			goto dma_err;
-		}
-	}
-
-	/* TODO: enable DMA it */
 	while (ctx->packets_left > 0) {
-		uint32_t packet_idx = ctx->xfer.num_packet - ctx->packets_left;
-		const struct mspi_xfer_packet *packet;
-
+		packet_idx = ctx->xfer.num_packet - ctx->packets_left;
 		packet = &ctx->xfer.packets[packet_idx];
+		/*
+			* Always starts with a command,
+			* then payload is given by the xfer->num_packet
+			*/
+		ret = mspi_stm32_access(controller, packet, (ctx->xfer.async == true) ? MSPI_ACCESS_ASYNC : MSPI_ACCESS_SYNC);
 
-		if (!ctx->xfer.async) {
-			/* Synchronous transfer */
-			ret = mspi_stm32_access(controller, packet, MSPI_ACCESS_DMA);
-		} else {
-			/* Asynchronous transfer DMA irq  with cb */
-			/* TODO what is the async DMA : NOT SUPPORTED */
-			goto dma_err;
-
-			if (ctx->callback && packet->cb_mask == MSPI_BUS_XFER_COMPLETE_CB) {
-				ctx->callback_ctx->mspi_evt.evt_type = MSPI_BUS_XFER_COMPLETE;
-				ctx->callback_ctx->mspi_evt.evt_data.controller = controller;
-				ctx->callback_ctx->mspi_evt.evt_data.dev_id = dev_data->ctx.owner;
-				ctx->callback_ctx->mspi_evt.evt_data.packet = packet;
-				ctx->callback_ctx->mspi_evt.evt_data.packet_idx = packet_idx;
-				ctx->callback_ctx->mspi_evt.evt_data.status = ~0;
-			}
-
-			mspi_callback_handler_t callback = NULL;
-
-			if (packet->cb_mask == MSPI_BUS_XFER_COMPLETE_CB) {
-				callback = (mspi_callback_handler_t)ctx->callback;
-			}
-
-			ret = mspi_stm32_access(controller, packet, MSPI_ACCESS_DMA);
-		}
 		ctx->packets_left--;
 		if (ret) {
-			goto dma_err;
+			ret = -EIO;
+			goto pio_end;
 		}
 	}
 
-	if (!ctx->xfer.async) {
-		while (ctx->packets_done < ctx->xfer.num_packet) {
-			k_busy_wait(10);
-		}
-	}
-
-dma_err:
-	mspi_context_release(ctx);
+pio_end:
+	k_sem_give(&ctx->lock);
 	return ret;
 }
 
@@ -1534,8 +1240,6 @@ static int mspi_stm32_transceive(const struct device *controller, const struct m
 				 const struct mspi_xfer *xfer)
 {
 	struct mspi_stm32_data *dev_data = controller->data;
-	mspi_callback_handler_t cb = NULL;
-	struct mspi_callback_context *cb_ctx = NULL;
 
 	if (dev_id != dev_data->dev_id) {
 		LOG_ERR("transceive : dev_id don't match");
@@ -1552,24 +1256,10 @@ static int mspi_stm32_transceive(const struct device *controller, const struct m
 	 */
 	if ((xfer->xfer_mode == MSPI_PIO) && ((xfer->packets->cmd == MSPI_STM32_OCMD_RDSR) ||
 					      (xfer->packets->cmd == MSPI_STM32_CMD_RDSR))) {
-		/* This is a command and an autopolling on the status register */
-		cb = (mspi_callback_handler_t)HAL_XSPI_StatusMatchCallback;
-		cb_ctx = dev_data->cb_ctxs[MSPI_BUS_XFER_COMPLETE];
-		return mspi_stm32_status_reg(controller, xfer, cb, cb_ctx);
+		return mspi_stm32_status_reg(controller, xfer);
 	}
 	if (xfer->xfer_mode == MSPI_PIO) {
-		if ((xfer->async) && (xfer->packets->dir == MSPI_TX)) {
-			cb = (mspi_callback_handler_t)HAL_XSPI_TxCpltCallback;
-			cb_ctx = dev_data->cb_ctxs[MSPI_BUS_XFER_COMPLETE];
-		}
-		if ((xfer->async) && (xfer->packets->dir == MSPI_RX)) {
-			cb = (mspi_callback_handler_t)HAL_XSPI_RxCpltCallback;
-			cb_ctx = dev_data->cb_ctxs[MSPI_BUS_XFER_COMPLETE];
-		}
-		return mspi_stm32_pio_transceive(controller, xfer, cb, cb_ctx);
-	} else if (xfer->xfer_mode == MSPI_DMA) {
-		/*  Do not care about xfer->async */
-		return mspi_stm32_dma_transceive(controller, xfer, cb, cb_ctx);
+		return mspi_stm32_pio_transceive(controller, xfer);
 	} else {
 		return -EIO;
 	}
@@ -1630,22 +1320,9 @@ static int mspi_stm32_config(const struct mspi_dt_spec *spec)
 		LOG_ERR("clock control device not ready");
 		return -ENODEV;
 	}
-	#ifdef CONFIG_STM32_MEMMAP || CONFIG_STM32_APP_IN_EXT_FLASH
-		/* If MemoryMapped then configure skip init
-		* Check clock status first as reading CR register without bus clock doesn't work on N6
-		* If clock is off, then MemoryMapped is off too and we do init
-		// */
-		if (clock_control_get_status(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
-					(clock_control_subsys_t) &dev_cfg->pclken)
-					== CLOCK_CONTROL_STATUS_ON) {
-			if (stm32_xspi_is_memorymap(&spec->bus)) {
-				LOG_ERR("NOR init'd in MemMapped mode");
-				/* Force HAL instance in correct state */
-				dev_data->hmspi.State = HAL_XSPI_STATE_BUSY_MEM_MAPPED;
-				return 0;
-			}
-		}
-	#endif
+
+	dev_cfg->irq_config();
+
 	/* Max 3 domain clock are expected */
 	if (dev_cfg->pclk_len > 3) {
 		LOG_ERR("Could not select %d XSPI domain clock", dev_cfg->pclk_len);
@@ -1673,11 +1350,7 @@ static int mspi_stm32_config(const struct mspi_dt_spec *spec)
 			LOG_ERR("Could not select MSPI domain clock");
 			return -EIO;
 		}
-		/*
-		 * Get the clock rate from this one (update ahb_clock_freq)
-		 * TODO: retrieve index in the clocks property where clocks has "mspi-ker"
-		 * Assuming index is 1
-		 */
+
 		if (clock_control_get_rate(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
 					   (clock_control_subsys_t)&dev_cfg->pclken[1],
 					   &ahb_clock_freq) < 0) {
@@ -1692,7 +1365,6 @@ static int mspi_stm32_config(const struct mspi_dt_spec *spec)
 			LOG_ERR("Could not enable XSPI Manager clock");
 			return -EIO;
 		}
-		/* Do NOT Get the clock rate from this one */
 	}
 
 	for (; prescaler <= MSPI_STM32_CLOCK_PRESCALER_MAX; prescaler++) {
@@ -1773,13 +1445,8 @@ static int mspi_stm32_config(const struct mspi_dt_spec *spec)
 
 #endif /* DLYB_ */
 
-	/* Initialize semaphores by Z_SEM_INITIALIZER */
-
-	/* Run IRQ init */
-	dev_cfg->irq_config();
-
 	if (!k_sem_count_get(&dev_data->ctx.lock)) {
-		dev_data->ctx.owner = NULL;
+		//dev_data->ctx.owner = NULL;
 		k_sem_give(&dev_data->ctx.lock);
 	}
 
@@ -1814,10 +1481,7 @@ static struct mspi_driver_api mspi_stm32_driver_api = {
 	.config = mspi_stm32_config,
 	.dev_config = mspi_stm32_dev_config,
 	.xip_config = mspi_stm32_xip_config,
-	.scramble_config = mspi_stm32_scramble_config,
-	.timing_config = mspi_stm32_timing_config,
 	.get_channel_status = mspi_stm32_get_channel_status,
-	.register_callback = mspi_stm32_register_callback,
 	.transceive = mspi_stm32_transceive,
 };
 
@@ -1832,81 +1496,55 @@ static struct mspi_driver_api mspi_stm32_driver_api = {
 		.sw_multi_periph = DT_INST_PROP_OR(n, software_multiperipheral, false),            \
 	}
 
+#define STM32_SMPI_IRQ_HANDLER(index)								\
+	static void mspi_stm32_irq_config_func_##index(void)					\
+	{											\
+		IRQ_CONNECT(DT_INST_IRQN(index), DT_INST_IRQ(index, priority), mspi_stm32_isr,	\
+			DEVICE_DT_INST_GET(index), 0);	\
+		irq_enable(DT_INST_IRQN(index));	\
+	}
 
-#define MSPI_FLASH_MODULE(drv_id, flash_id) (DT_DRV_INST(drv_id), mspi_nor_flash_##flash_id)
+#define MSPI_STM32_INIT(index)                                                              \
+	static const struct stm32_pclken pclken_##index[] = STM32_DT_INST_CLOCKS(index);	\
+	PINCTRL_DT_INST_DEFINE(index);								\
+	\
+	static struct gpio_dt_spec ce_gpios##n[] = MSPI_CE_GPIOS_DT_SPEC_INST_GET(n);             \
+	STM32_SMPI_IRQ_HANDLER(index)								\
+	static const struct mspi_stm32_conf mspi_stm32_dev_conf_##index = {	\
+		.pclken = pclken_##index,	\
+		.pclk_len = DT_INST_NUM_CLOCKS(index),	\
+		.irq_config =  mspi_stm32_irq_config_func_##index,				\
+		.mspicfg = MSPI_CONFIG(index),	\
+		.pcfg = PINCTRL_DT_DEV_CONFIG_GET(DT_DRV_INST(index)),	\
+		.mspicfg.num_ce_gpios  = ARRAY_SIZE(ce_gpios##n),				\
+	};											\
+	static struct mspi_stm32_data mspi_stm32_dev_data_##index = {                           \
+		.hmspi = {                                                                          \
+		.Instance = (XSPI_TypeDef *)DT_INST_REG_ADDR(index),                             \
+		.Init = {                                                                        \
+			.FifoThresholdByte = MSPI_STM32_FIFO_THRESHOLD,                              \
+			.SampleShifting = (DT_INST_PROP(index, ssht_enable)                          \
+					? HAL_XSPI_SAMPLE_SHIFT_HALFCYCLE                       \
+					: HAL_XSPI_SAMPLE_SHIFT_NONE),                           \
+			.ChipSelectHighTimeCycle = 1,                                                \
+			.ClockMode = HAL_XSPI_CLOCK_MODE_0,                                          \
+			.ChipSelectBoundary = 0,                                                     \
+			.MemoryMode = HAL_XSPI_SINGLE_MEM,                                           \
+			.MemorySize = 0x19,                                                          \
+			.FreeRunningClock = HAL_XSPI_FREERUNCLK_DISABLE,                              \
+		},                                                                               \
+		},                                                                                   \
+		.memmap_base_addr  = DT_REG_ADDR_BY_IDX(DT_DRV_INST(index), 1),	\
+		.dev_id = index,                                                                     \
+		.lock = Z_MUTEX_INITIALIZER(mspi_stm32_dev_data_##index.lock),                       \
+		.sync = Z_SEM_INITIALIZER(mspi_stm32_dev_data_##index.sync, 0, 1),                   \
+		.dev_cfg = {0},                                                                      \
+		.xip_cfg = {0},                                                                      \
+		.ctx.lock = Z_SEM_INITIALIZER(mspi_stm32_dev_data_##index.ctx.lock, 0, 1),           \
+	};                                                                                       \
+	\
+	DEVICE_DT_INST_DEFINE(index, &mspi_stm32_init, NULL, &mspi_stm32_dev_data_##index,       \
+				&mspi_stm32_dev_conf_##index, POST_KERNEL,                                 \
+				CONFIG_KERNEL_INIT_PRIORITY_DEVICE, &mspi_stm32_driver_api);
 
-#define DT_WRITEOC_PROP_OR(inst, default_value)                                                    \
-	COND_CODE_1(DT_INST_NODE_HAS_PROP(inst, writeoc),					\
-		    (_CONCAT(HAL_XSPI_CMD_, DT_STRING_TOKEN(DT_DRV_INST(inst), writeoc))),	\
-		    ((default_value)))
-
-#define DT_QER_PROP_OR(inst, default_value)                                                        \
-	COND_CODE_1(DT_INST_NODE_HAS_PROP(inst, quad_enable_requirements),			\
-		    (_CONCAT(JESD216_DW15_QER_VAL_,						\
-			     DT_STRING_TOKEN(DT_DRV_INST(inst), quad_enable_requirements))),	\
-		    ((default_value)))
-
-static void mspi_stm32_irq_config_func(void);
-
-static const struct stm32_pclken pclken[] = STM32_DT_INST_CLOCKS(0);
-
-PINCTRL_DT_DEFINE(DT_DRV_INST(0));
-
-static const struct mspi_stm32_conf mspi_stm32_dev_conf = {
-	.reg_base = DT_INST_REG_ADDR(0),
-	.reg_size = DT_INST_REG_SIZE(0),
-	.pclken = pclken,
-	.pclk_len = DT_INST_NUM_CLOCKS(0),
-	.irq_config = mspi_stm32_irq_config_func,
-	.mspicfg = MSPI_CONFIG(0),
-	.pcfg = PINCTRL_DT_DEV_CONFIG_GET(DT_DRV_INST(0)),
-#if MSPI_STM32_RESET_GPIO
-	.reset = GPIO_DT_SPEC_INST_GET(0, reset_gpios),
-#endif /* MSPI_STM32_RESET_GPIO */
-};
-
-static struct mspi_stm32_data mspi_stm32_dev_data = {
-	.hmspi = {
-			.Instance = (XSPI_TypeDef *)DT_INST_REG_ADDR(0),
-			.Init = {
-					.FifoThresholdByte = MSPI_STM32_FIFO_THRESHOLD,
-					.SampleShifting = (DT_INST_PROP(0, ssht_enable)
-								   ? HAL_XSPI_SAMPLE_SHIFT_HALFCYCLE
-								   : HAL_XSPI_SAMPLE_SHIFT_NONE),
-					.ChipSelectHighTimeCycle = 1,
-					.ClockMode = HAL_XSPI_CLOCK_MODE_0,
-					.ChipSelectBoundary = 0,
-					.MemoryMode = HAL_XSPI_SINGLE_MEM,
-/* MemorySize should come from the mspi_nor_mx device (CHILD) */
-					.MemorySize = 0x19,
-#if defined(HAL_XSPIM_IOPORT_1) || defined(HAL_XSPIM_IOPORT_2)
-					.MemorySelect = ((DT_INST_PROP(0, ncs_line) == 1)
-								 ? HAL_XSPI_CSSEL_NCS1
-								 : HAL_XSPI_CSSEL_NCS2),
-#endif
-					.FreeRunningClock = HAL_XSPI_FREERUNCLK_DISABLE,
-#if defined(OCTOSPI_DCR4_REFRESH)
-					.Refresh = 0,
-#endif
-				},
-		},
-	.dev_id = 0, /* Value matching the <reg> of the ospi-nor-flash device */
-	.lock = Z_MUTEX_INITIALIZER(mspi_stm32_dev_data.lock),
-	.sync = Z_SEM_INITIALIZER(mspi_stm32_dev_data.sync, 0, 1),
-	.dev_cfg = {0},
-	.xip_cfg = {0},
-	.scramble_cfg = {0},
-	.cbs = {0},
-	.cb_ctxs = {0},
-	.ctx.lock = Z_SEM_INITIALIZER(mspi_stm32_dev_data.ctx.lock, 0, 1),
-};
-
-static void mspi_stm32_irq_config_func(void)
-{
-	IRQ_CONNECT(DT_INST_IRQN(0), DT_INST_IRQ(0, priority), mspi_stm32_isr,
-		    DEVICE_DT_INST_GET(0), 0);
-	irq_enable(DT_INST_IRQN(0));
-}
-
-DEVICE_DT_INST_DEFINE(0, &mspi_stm32_init, NULL, &mspi_stm32_dev_data, &mspi_stm32_dev_conf,
-		      POST_KERNEL, CONFIG_KERNEL_INIT_PRIORITY_DEVICE, &mspi_stm32_driver_api);
+DT_INST_FOREACH_STATUS_OKAY(MSPI_STM32_INIT)
